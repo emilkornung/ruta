@@ -370,6 +370,7 @@ def run_slice(
     """
     if banderoll:
         pdf_bytes = rotate_pdf_90(pdf_bytes)
+        width_m, height_m = height_m, width_m  # swap: landscape PDF becomes portrait after rotation
 
     # Mirror ruta.py logic: ENABLE_COLOR_LABELS=False means always skip
     effective_skip = skip_colors or (not ENABLE_COLOR_LABELS)
