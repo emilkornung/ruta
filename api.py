@@ -49,6 +49,7 @@ async def slice_pdf(
             }
             for s in result["strips"]
         ],
+        "grid_pdf": base64.b64encode(result["grid_pdf"]).decode(),
         "unknown_colors": result["unknown_colors"],
     }
 
