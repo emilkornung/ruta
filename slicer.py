@@ -387,24 +387,28 @@ def generate_grid_pdf(pdf_bytes, width_m, height_m):
             ny1 = min((s + 1) * strip_w_pts, full_w)
             cell_w = ny1 - ny0
             top_fs = max(6, min(14, cell_w / 8))
-            new_page.insert_textbox(
-                fitz.Rect(2, ny0 + 2, 2 + top_fs + 4, ny1 - 2),
-                f"Rad {s + 1}", fontsize=top_fs, color=(0.9, 0.1, 0.1), align=1)
+            label_rect = fitz.Rect(2, ny0 + 2, 2 + top_fs + 4, ny1 - 2)
+            if label_rect.is_valid and label_rect.width > 2 and label_rect.height > 2:
+                new_page.insert_textbox(
+                    label_rect,
+                    f"Rad {s + 1}", fontsize=top_fs, color=(0.9, 0.1, 0.1), align=1)
 
             for page_num in range(num_pages):
                 nx0 = page_num * page_h_pts
                 nx1 = min((page_num + 1) * page_h_pts, full_h)
                 cell_h = nx1 - nx0
                 fs = max(6, min(24, min(cell_w, cell_h) / 10))
-                rc = new_page.insert_textbox(
-                    fitz.Rect(nx0 + 4, ny0 + 4, nx1 - 4, ny1 - 4),
-                    f"Rad {s + 1} / Ruta {page_num + 1}",
-                    fontsize=fs, color=(0.9, 0.1, 0.1), align=1)
-                if rc < 0:
-                    new_page.insert_text(
-                        fitz.Point(nx0 + 2, ny0 + fs + 2),
-                        f"R{s + 1}/R{page_num + 1}",
-                        fontsize=max(5, fs * 0.7), color=(0.9, 0.1, 0.1))
+                cell_rect = fitz.Rect(nx0 + 4, ny0 + 4, nx1 - 4, ny1 - 4)
+                if cell_rect.is_valid and cell_rect.width > 2 and cell_rect.height > 2:
+                    rc = new_page.insert_textbox(
+                        cell_rect,
+                        f"Rad {s + 1} / Ruta {page_num + 1}",
+                        fontsize=fs, color=(0.9, 0.1, 0.1), align=1)
+                    if rc < 0:
+                        new_page.insert_text(
+                            fitz.Point(nx0 + 2, ny0 + fs + 2),
+                            f"R{s + 1}/R{page_num + 1}",
+                            fontsize=max(5, fs * 0.7), color=(0.9, 0.1, 0.1))
 
     buf = io.BytesIO()
     out_doc.save(buf)
