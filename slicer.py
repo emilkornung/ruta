@@ -348,75 +348,6 @@ def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None):
     return [(n, results[n]) for n in sorted(results)]
 
 
-def generate_grid_pdf(pdf_bytes, width_m, height_m):
-    """
-    Generate a rotated grid overview (rotate=270). Bottom→top numbering.
-    Ruta 1 on LEFT (bottom of design), last Ruta on RIGHT (top/small).
-    """
-    src_doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
-    out_doc    = fitz.open()
-    num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
-    num_pages  = math.ceil(height_m / PAGE_HEIGHT_M)
-
-    for src_page in src_doc:
-        r       = src_page.rect
-        full_w  = r.width
-        full_h  = r.height
-        strip_w_pts = STRIP_WIDTH_M * (full_w / width_m)
-        page_h_pts  = PAGE_HEIGHT_M * (full_h / height_m)
-
-        new_page = out_doc.new_page(width=full_h, height=full_w)
-        new_page.show_pdf_page(new_page.rect, src_doc, src_page.number, rotate=270)
-
-        shape = new_page.new_shape()
-        for k in range(1, num_pages):
-            nx = k * page_h_pts
-            shape.draw_line(fitz.Point(nx, 0), fitz.Point(nx, full_w))
-        shape.finish(color=(0.9, 0.1, 0.1), width=1.5, stroke_opacity=0.6)
-        shape.commit()
-
-        shape = new_page.new_shape()
-        for s in range(1, num_strips):
-            ny = s * strip_w_pts
-            shape.draw_line(fitz.Point(0, ny), fitz.Point(full_h, ny))
-        shape.finish(color=(0.9, 0.1, 0.1), width=1.5, stroke_opacity=0.6)
-        shape.commit()
-
-        for s in range(num_strips):
-            ny0 = s * strip_w_pts
-            ny1 = min((s + 1) * strip_w_pts, full_w)
-            cell_w = ny1 - ny0
-            top_fs = max(6, min(14, cell_w / 8))
-            label_rect = fitz.Rect(2, ny0 + 2, 2 + top_fs + 4, ny1 - 2)
-            if label_rect.is_valid and label_rect.width > 2 and label_rect.height > 2:
-                new_page.insert_textbox(
-                    label_rect,
-                    f"Rad {s + 1}", fontsize=top_fs, color=(0.9, 0.1, 0.1), align=1)
-
-            for page_num in range(num_pages):
-                nx0 = page_num * page_h_pts
-                nx1 = min((page_num + 1) * page_h_pts, full_h)
-                cell_h = nx1 - nx0
-                fs = max(6, min(24, min(cell_w, cell_h) / 10))
-                cell_rect = fitz.Rect(nx0 + 4, ny0 + 4, nx1 - 4, ny1 - 4)
-                if cell_rect.is_valid and cell_rect.width > 2 and cell_rect.height > 2:
-                    rc = new_page.insert_textbox(
-                        cell_rect,
-                        f"Rad {s + 1} / Ruta {page_num + 1}",
-                        fontsize=fs, color=(0.9, 0.1, 0.1), align=1)
-                    if rc < 0:
-                        new_page.insert_text(
-                            fitz.Point(nx0 + 2, ny0 + fs + 2),
-                            f"R{s + 1}/R{page_num + 1}",
-                            fontsize=max(5, fs * 0.7), color=(0.9, 0.1, 0.1))
-
-    buf = io.BytesIO()
-    out_doc.save(buf)
-    out_doc.close()
-    src_doc.close()
-    return buf.getvalue()
-
-
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def run_slice(
@@ -439,7 +370,6 @@ def run_slice(
     """
     if banderoll:
         pdf_bytes = rotate_pdf_90(pdf_bytes)
-        width_m, height_m = height_m, width_m  # swap: landscape PDF becomes portrait after rotation
 
     # Mirror ruta.py logic: ENABLE_COLOR_LABELS=False means always skip
     effective_skip = skip_colors or (not ENABLE_COLOR_LABELS)
@@ -462,6 +392,4 @@ def run_slice(
         for strip_num, strip_bytes in strips_raw
     ]
 
-    grid_bytes = generate_grid_pdf(pdf_bytes, width_m, height_m)
-
-    return {"strips": strips, "unknown_colors": unknown_colors, "grid_pdf": grid_bytes}
+    return {"strips": strips, "unknown_colors": unknown_colors}
