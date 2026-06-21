@@ -24,18 +24,21 @@ async def slice_pdf(
     width_m: float = Form(...),
     height_m: float = Form(...),
     banderoll: str = Form('false'),
-    skip_colors: str = Form('false')
+    skip_colors: str = Form('false'),
+    ruta_nedre: str = Form('false')
 ):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "Only PDF files are accepted")
 
     banderoll_bool = parse_bool(banderoll)
     skip_colors_bool = parse_bool(skip_colors)
+    ruta_nedre_bool = parse_bool(ruta_nedre)
 
     logger.info(
         f"Request: width={width_m}, height={height_m}, "
         f"banderoll={banderoll!r} → {banderoll_bool}, "
-        f"skip_colors={skip_colors!r} → {skip_colors_bool}"
+        f"skip_colors={skip_colors!r} → {skip_colors_bool}, "
+        f"ruta_nedre={ruta_nedre!r} → {ruta_nedre_bool}"
     )
 
     pdf_bytes = await file.read()
@@ -44,7 +47,8 @@ async def slice_pdf(
         width_m,
         height_m,
         banderoll=banderoll_bool,
-        skip_colors=skip_colors_bool
+        skip_colors=skip_colors_bool,
+        ruta_nedre=ruta_nedre_bool
     )
 
     return {

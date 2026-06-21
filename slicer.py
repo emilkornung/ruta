@@ -254,7 +254,7 @@ def slice_one_strip(args):
     Color labels are added PER STRIP PAGE after rendering (never cross slice boundaries).
     Returns (strip_number, pdf_bytes).
     """
-    s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map = args
+    s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map, ruta_nedre = args
 
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc = fitz.open()
@@ -273,9 +273,19 @@ def slice_one_strip(args):
         x1 = min((s + 1) * strip_w_pts, full_w)
 
         # ── PROTECTED ROTATION BLOCK — DO NOT CHANGE WITHOUT EXPLICIT CONSENT ─
+        # Default (ruta_nedre=False): bottom-to-top — page 1 = bottom of design,
+        # partial/pink leftover at the top. This path is PROTECTED and unchanged.
+        # ruta_nedre=True: top-to-bottom — page 1 = top of design, partial/pink
+        # leftover lands at the bottom (the end of the sewing sequence). Content
+        # is right-aligned and the pink fills the left so the dead space still
+        # sits on the design's free outer edge (mirror of the default layout).
         for page_num in range(num_pages):
-            y1 = full_h - page_num * page_h_pts
-            y0 = max(0.0, full_h - (page_num + 1) * page_h_pts)
+            if ruta_nedre:
+                y0 = page_num * page_h_pts
+                y1 = min(full_h, (page_num + 1) * page_h_pts)
+            else:
+                y1 = full_h - page_num * page_h_pts
+                y0 = max(0.0, full_h - (page_num + 1) * page_h_pts)
 
             clip = fitz.Rect(x0, y0, x1, y1)
 
@@ -285,7 +295,12 @@ def slice_one_strip(args):
             content_w  = y1 - y0
             is_partial = content_w < page_h_pts - 1
             new_page   = out_doc.new_page(width=page_h_pts, height=x1 - x0)
-            dest_rect  = fitz.Rect(0, 0, content_w, x1 - x0)
+            if ruta_nedre:
+                pad_x     = page_h_pts - content_w
+                dest_rect = fitz.Rect(pad_x, 0, page_h_pts, x1 - x0)
+            else:
+                pad_x     = content_w
+                dest_rect = fitz.Rect(0, 0, content_w, x1 - x0)
             new_page.show_pdf_page(dest_rect, src_doc, src_page.number, clip=clip, rotate=270)
         # ── END PROTECTED BLOCK ───────────────────────────────────────────────
 
@@ -293,20 +308,31 @@ def slice_one_strip(args):
             if color_map:
                 _add_color_labels(new_page, color_map, strip_w_pts)
 
-            # Pink padding + dotted cut line on partial pages
+            # Pink padding + dotted cut line on partial pages.
+            # pad_x is the content↔pink boundary (= cut line). Default: content on
+            # the left, pink on the right. ruta_nedre: mirrored — content on the
+            # right, pink on the left — so the dead space stays on the design's
+            # free outer edge after the top-to-bottom flip.
             if is_partial:
+                if ruta_nedre:
+                    pink_rect = fitz.Rect(0, 0, pad_x, x1 - x0)
+                    klipp_pt  = fitz.Point(max(2.0, pad_x - 22), 10)
+                else:
+                    pink_rect = fitz.Rect(pad_x, 0, page_h_pts, x1 - x0)
+                    klipp_pt  = fitz.Point(pad_x + 3, 10)
+
                 shape = new_page.new_shape()
-                shape.draw_rect(fitz.Rect(content_w, 0, page_h_pts, x1 - x0))
+                shape.draw_rect(pink_rect)
                 shape.finish(fill=(PINK_PAD_R, PINK_PAD_G, PINK_PAD_B), fill_opacity=1.0, color=None)
                 shape.commit()
 
                 shape = new_page.new_shape()
-                shape.draw_line(fitz.Point(content_w, 0), fitz.Point(content_w, x1 - x0))
+                shape.draw_line(fitz.Point(pad_x, 0), fitz.Point(pad_x, x1 - x0))
                 shape.finish(color=(0.15, 0.15, 0.15), width=1.0, dashes="[4 4] 0")
                 shape.commit()
 
                 new_page.insert_text(
-                    fitz.Point(content_w + 3, 10),
+                    klipp_pt,
                     "Klipp",
                     fontsize = 6,
                     color    = (0.15, 0.15, 0.15),
@@ -327,13 +353,13 @@ def slice_one_strip(args):
     return (s + 1, buf.getvalue())
 
 
-def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None):
+def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False):
     """Slice pdf_bytes into vertical strips in parallel. Returns sorted list of (strip_num, bytes)."""
     num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
     num_pages  = math.ceil(height_m / PAGE_HEIGHT_M)
 
     args = [
-        (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {})
+        (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {}, ruta_nedre)
         for s in range(num_strips)
     ]
 
@@ -428,6 +454,7 @@ def run_slice(
     height_m: float,
     banderoll: bool = False,
     skip_colors: bool = False,
+    ruta_nedre: bool = False,
 ) -> dict:
     """
     Slices a PDF into 1.5m-wide vertical strips.
@@ -457,7 +484,7 @@ def run_slice(
     else:
         color_map = {}
 
-    strips_raw = _slice_pdf(pdf_bytes, width_m, height_m, color_map)
+    strips_raw = _slice_pdf(pdf_bytes, width_m, height_m, color_map, ruta_nedre=ruta_nedre)
 
     strips = [
         {"filename": f"strip-{strip_num:02d}.pdf", "bytes": strip_bytes}
