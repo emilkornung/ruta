@@ -26,13 +26,13 @@ SLICE_WORKERS = 6
 VERSION = "1.1.0"
 
 # Pink page detection
-PINK_THRESHOLD         = 0.95    # raised from 0.85 — only skip near-pure pink pages
+PINK_THRESHOLD         = 0.85
 PINK_R_MIN             = 180
 PINK_G_MIN, PINK_G_MAX = 100, 190
 PINK_B_MIN, PINK_B_MAX = 140, 220
 
 # Orange background detection (used for split "nedre" designs)
-ORANGE_THRESHOLD           = 0.95    # conservative — only skip near-pure orange pages
+ORANGE_THRESHOLD           = 0.85
 ORANGE_R_MIN               = 220
 ORANGE_G_MIN, ORANGE_G_MAX = 90, 165
 ORANGE_B_MAX               = 60
