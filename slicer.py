@@ -23,11 +23,19 @@ STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
 SLICE_WORKERS = 6
 
+VERSION = "1.1.0"
+
 # Pink page detection
-PINK_THRESHOLD         = 0.85
+PINK_THRESHOLD         = 0.95    # raised from 0.85 — only skip near-pure pink pages
 PINK_R_MIN             = 180
 PINK_G_MIN, PINK_G_MAX = 100, 190
 PINK_B_MIN, PINK_B_MAX = 140, 220
+
+# Orange background detection (used for split "nedre" designs)
+ORANGE_THRESHOLD           = 0.95    # conservative — only skip near-pure orange pages
+ORANGE_R_MIN               = 220
+ORANGE_G_MIN, ORANGE_G_MAX = 90, 165
+ORANGE_B_MAX               = 60
 
 # Pink padding color for partial pages (0–1 RGB)
 PINK_PAD_R, PINK_PAD_G, PINK_PAD_B = 0.957, 0.565, 0.710  # ≈ #F490B5
@@ -37,11 +45,12 @@ ENABLE_COLOR_LABELS = False    # Master switch — set False to disable color la
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def is_fully_pink(src_doc, src_page_num, clip):
+def is_fully_background(src_doc, src_page_num, clip):
     """
-    Render the clip region at low resolution and check if it's mostly the
-    light pink background color (~R244 G144 B181). Returns True if >85% of
-    pixels are pink-ish, meaning the page has no real content.
+    Render the clip region at low resolution and check if it's mostly
+    the light pink background (~R244 G144 B181) OR the orange background
+    (~R255 G128 B0). Returns True if >95% of pixels match either color,
+    meaning the page has no real content worth printing.
     """
     mat = fitz.Matrix(0.05, 0.05)  # tiny render — fast, just for color sampling
     pix = src_doc[src_page_num].get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csRGB)
@@ -49,15 +58,20 @@ def is_fully_pink(src_doc, src_page_num, clip):
     total   = pix.width * pix.height
     if total == 0:
         return False
-    pink_count = 0
+    background_count = 0
     for i in range(0, len(samples), 3):
         r, g, b = samples[i], samples[i + 1], samples[i + 2]
-        if (r > PINK_R_MIN
-                and PINK_G_MIN < g < PINK_G_MAX
-                and PINK_B_MIN < b < PINK_B_MAX
-                and r > g and r > b):
-            pink_count += 1
-    return (pink_count / total) > PINK_THRESHOLD
+        is_pink = (r > PINK_R_MIN
+                   and PINK_G_MIN < g < PINK_G_MAX
+                   and PINK_B_MIN < b < PINK_B_MAX
+                   and r > g and r > b)
+        is_orange = (r > ORANGE_R_MIN
+                     and ORANGE_G_MIN < g < ORANGE_G_MAX
+                     and b < ORANGE_B_MAX
+                     and r > g and g > b)
+        if is_pink or is_orange:
+            background_count += 1
+    return (background_count / total) > ORANGE_THRESHOLD
 
 
 def rotate_pdf_90(pdf_bytes, clockwise=True):
@@ -298,7 +312,7 @@ def slice_one_strip(args):
 
             clip = fitz.Rect(x0, y0, x1, y1)
 
-            if is_fully_pink(src_doc, src_page.number, clip):
+            if is_fully_background(src_doc, src_page.number, clip):
                 continue
 
             content_w  = y1 - y0
