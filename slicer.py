@@ -274,18 +274,27 @@ def slice_one_strip(args):
 
         # ── PROTECTED ROTATION BLOCK — DO NOT CHANGE WITHOUT EXPLICIT CONSENT ─
         # Default (ruta_nedre=False): bottom-to-top — page 1 = bottom of design,
-        # partial/pink leftover at the top. This path is PROTECTED and unchanged.
+        # partial/pink leftover at the top. rotate=270. This path is PROTECTED and
+        # MUST stay pixel-identical.
         # ruta_nedre=True: top-to-bottom — page 1 = top of design, partial/pink
-        # leftover lands at the bottom (the end of the sewing sequence). Content
-        # is right-aligned and the pink fills the left so the dead space still
-        # sits on the design's free outer edge (mirror of the default layout).
+        # leftover lands at the design's bottom (the end of the sewing sequence).
+        # The ONLY differences from the default path are (1) the bands are taken
+        # top-to-bottom and (2) rotate=90 instead of 270. rotate=90 reverses the
+        # within-page design-y direction (so consecutive pages flow continuously
+        # under top-to-bottom page numbering — verified R0,R1,…) while keeping the
+        # artwork faithful (a pure rotation, NOT a mirror — no backwards text).
+        # Everything else — left-aligned content, pink/cut on the right free edge,
+        # page numbering — is shared with the default path so the Rad (strip)
+        # left-to-right order and grid stay identical to default (see note below).
         for page_num in range(num_pages):
             if ruta_nedre:
                 y0 = page_num * page_h_pts
                 y1 = min(full_h, (page_num + 1) * page_h_pts)
+                rotate = 90
             else:
                 y1 = full_h - page_num * page_h_pts
                 y0 = max(0.0, full_h - (page_num + 1) * page_h_pts)
+                rotate = 270
 
             clip = fitz.Rect(x0, y0, x1, y1)
 
@@ -295,13 +304,14 @@ def slice_one_strip(args):
             content_w  = y1 - y0
             is_partial = content_w < page_h_pts - 1
             new_page   = out_doc.new_page(width=page_h_pts, height=x1 - x0)
-            if ruta_nedre:
-                pad_x     = page_h_pts - content_w
-                dest_rect = fitz.Rect(pad_x, 0, page_h_pts, x1 - x0)
-            else:
-                pad_x     = content_w
-                dest_rect = fitz.Rect(0, 0, content_w, x1 - x0)
-            new_page.show_pdf_page(dest_rect, src_doc, src_page.number, clip=clip, rotate=270)
+            # Identical placement in both modes: content left-aligned, pink fills
+            # the right free edge. For ruta_nedre the rotate=90 above puts that
+            # free edge on the design's BOTTOM (the leftover-at-end edge); for the
+            # default rotate=270 it is the design's TOP. content_w is the true
+            # captured source height, used for both clip extent and dest width.
+            pad_x     = content_w
+            dest_rect = fitz.Rect(0, 0, content_w, x1 - x0)
+            new_page.show_pdf_page(dest_rect, src_doc, src_page.number, clip=clip, rotate=rotate)
         # ── END PROTECTED BLOCK ───────────────────────────────────────────────
 
             # Color labels — per page, after rendering, using pixel centroid detection
@@ -309,17 +319,14 @@ def slice_one_strip(args):
                 _add_color_labels(new_page, color_map, strip_w_pts)
 
             # Pink padding + dotted cut line on partial pages.
-            # pad_x is the content↔pink boundary (= cut line). Default: content on
-            # the left, pink on the right. ruta_nedre: mirrored — content on the
-            # right, pink on the left — so the dead space stays on the design's
-            # free outer edge after the top-to-bottom flip.
+            # pad_x (= content_w) is the content↔pink boundary (= cut line). In
+            # BOTH modes the content is left-aligned and the pink dead-space fills
+            # the right — the design's free outer edge. rotate makes that edge the
+            # design TOP (default) or BOTTOM (ruta_nedre); the placement code is
+            # the same.
             if is_partial:
-                if ruta_nedre:
-                    pink_rect = fitz.Rect(0, 0, pad_x, x1 - x0)
-                    klipp_pt  = fitz.Point(max(2.0, pad_x - 22), 10)
-                else:
-                    pink_rect = fitz.Rect(pad_x, 0, page_h_pts, x1 - x0)
-                    klipp_pt  = fitz.Point(pad_x + 3, 10)
+                pink_rect = fitz.Rect(pad_x, 0, page_h_pts, x1 - x0)
+                klipp_pt  = fitz.Point(pad_x + 3, 10)
 
                 shape = new_page.new_shape()
                 shape.draw_rect(pink_rect)
@@ -374,10 +381,21 @@ def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False):
     return [(n, results[n]) for n in sorted(results)]
 
 
-def generate_grid_pdf(pdf_bytes, width_m, height_m):
+def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False):
     """
-    Generate a rotated grid overview (rotate=270). Bottom→top numbering.
-    Rad 1 on LEFT (bottom of design), last Rad on RIGHT (top/small).
+    Generate a rotated grid overview that matches the sliced strips.
+
+    Default (ruta_nedre=False): rotate=270, bottom→top page numbering. UNCHANGED
+    and byte-identical to before.
+
+    ruta_nedre=True: rotate=90 to match the strips (top→bottom page flow). This
+    keeps the design-y→grid-x direction increasing so "Ruta 1" still labels the
+    design's TOP band at grid-left (same label positions as default). rotate=90
+    reverses the design-x→grid-y direction, so each strip's content lands on the
+    vertically-flipped band; the Rad bands are flipped to match so every "Rad s"
+    label sits on the strip it names. The Rad NUMBERING is unchanged — Rad 1 is
+    still strip 0 = the leftmost design column — so the Rad left-to-right order is
+    identical to default.
     """
     src_doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc    = fitz.open()
@@ -391,8 +409,19 @@ def generate_grid_pdf(pdf_bytes, width_m, height_m):
         strip_w_pts = STRIP_WIDTH_M * (full_w / width_m)
         page_h_pts  = PAGE_HEIGHT_M * (full_h / height_m)
 
+        # Grid-y band [ny0, ny1] occupied by strip s. rotate=90 flips design-x→y
+        # so for ruta_nedre the band is mirrored about full_w (keeps the label on
+        # the strip's actual content); Rad numbering itself is unchanged.
+        def strip_band(s):
+            x0s = s * strip_w_pts
+            x1s = min((s + 1) * strip_w_pts, full_w)
+            if ruta_nedre:
+                return (full_w - x1s, full_w - x0s)
+            return (x0s, x1s)
+
         new_page = out_doc.new_page(width=full_h, height=full_w)
-        new_page.show_pdf_page(new_page.rect, src_doc, src_page.number, rotate=270)
+        new_page.show_pdf_page(new_page.rect, src_doc, src_page.number,
+                               rotate=90 if ruta_nedre else 270)
 
         shape = new_page.new_shape()
         for k in range(1, num_pages):
@@ -403,14 +432,13 @@ def generate_grid_pdf(pdf_bytes, width_m, height_m):
 
         shape = new_page.new_shape()
         for s in range(1, num_strips):
-            ny = s * strip_w_pts
+            ny = (full_w - s * strip_w_pts) if ruta_nedre else (s * strip_w_pts)
             shape.draw_line(fitz.Point(0, ny), fitz.Point(full_h, ny))
         shape.finish(color=(0.9, 0.1, 0.1), width=1.5, stroke_opacity=0.6)
         shape.commit()
 
         for s in range(num_strips):
-            ny0 = s * strip_w_pts
-            ny1 = min((s + 1) * strip_w_pts, full_w)
+            ny0, ny1 = strip_band(s)
             cell_w = ny1 - ny0
             top_fs = max(6, min(14, cell_w / 8))
 
@@ -491,6 +519,6 @@ def run_slice(
         for strip_num, strip_bytes in strips_raw
     ]
 
-    grid_bytes = generate_grid_pdf(pdf_bytes, width_m, height_m)
+    grid_bytes = generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=ruta_nedre)
 
     return {"strips": strips, "unknown_colors": unknown_colors, "grid_pdf": grid_bytes}
