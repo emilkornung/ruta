@@ -2,3 +2,5 @@ fastapi
 uvicorn
 pymupdf
 python-multipart
+numpy
+scipy
