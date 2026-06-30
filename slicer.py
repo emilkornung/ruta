@@ -7,23 +7,18 @@ standalone backup). This module contains only the PDF geometry logic.
 """
 
 import io
-import json
 import math
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz  # pymupdf
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
-COLOR_MAP_FILE = os.path.join(SCRIPT_DIR, "color_map.json")
-
 STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
 SLICE_WORKERS = 6
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Pink page detection
 PINK_THRESHOLD         = 0.85
@@ -101,16 +96,10 @@ def rotate_pdf_90(pdf_bytes, clockwise=True):
 
 
 # ── Color mapping ─────────────────────────────────────────────────────────────
-
-def load_color_map():
-    """Load color_map.json. Creates an empty file if it doesn't exist yet."""
-    if not os.path.exists(COLOR_MAP_FILE):
-        with open(COLOR_MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f, indent=2)
-        return {}
-    with open(COLOR_MAP_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
+# The colour map is no longer loaded from a local color_map.json. It is sourced
+# from Supabase (the colour_map table) by the web app and passed into run_slice()
+# via the `colour_map` parameter as a {hex: ncs_code} dict — the exact shape the
+# active _add_color_labels() labeling path consumes (see run_slice / api.py).
 
 def _fill_to_hex(fill):
     """Convert pymupdf fill tuple (r, g, b) in 0–1 range to '#RRGGBB'."""
@@ -497,9 +486,16 @@ def run_slice(
     banderoll: bool = False,
     skip_colors: bool = False,
     ruta_nedre: bool = False,
+    colour_map: dict = None,
 ) -> dict:
     """
     Slices a PDF into 1.5m-wide vertical strips.
+
+    colour_map is a {hex: ncs_code} dict sourced from Supabase and passed in by
+    the caller (api.py). It replaces the retired local color_map.json. When
+    labeling is disabled (ENABLE_COLOR_LABELS=False) it is ignored, exactly as
+    the file-loaded map was.
+
     Returns:
     {
         "strips": [
@@ -517,7 +513,7 @@ def run_slice(
     unknown_colors = []
 
     if not effective_skip:
-        color_map  = load_color_map()
+        color_map  = colour_map or {}
         hex_colors = extract_pdf_colors(pdf_bytes)
         unknown_colors = sorted(c for c in hex_colors if c not in color_map)
         if unknown_colors:

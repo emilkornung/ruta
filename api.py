@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 import base64
+import json
 import logging
 from slicer import run_slice, VERSION
 
@@ -25,7 +26,8 @@ async def slice_pdf(
     height_m: float = Form(...),
     banderoll: str = Form('false'),
     skip_colors: str = Form('false'),
-    ruta_nedre: str = Form('false')
+    ruta_nedre: str = Form('false'),
+    colour_map: str = Form('')
 ):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "Only PDF files are accepted")
@@ -34,11 +36,25 @@ async def slice_pdf(
     skip_colors_bool = parse_bool(skip_colors)
     ruta_nedre_bool = parse_bool(ruta_nedre)
 
+    # Colour map arrives as a JSON array of {hex, ncs_code, tolerance} sourced
+    # from Supabase (the web app's getColourMapForRuta). Collapse it into the
+    # {hex: ncs_code} dict the active _add_color_labels() path consumes. Hex is
+    # upper-cased to match the keys that labeling builds from rendered pixels.
+    # tolerance is not consumed by the current exact-match labeling path; it is
+    # reserved for the TIF-27 tolerance-band labeling once that is enabled.
+    colour_map_list = json.loads(colour_map) if colour_map else []
+    colour_map_dict = {
+        entry["hex"].upper(): entry["ncs_code"]
+        for entry in colour_map_list
+        if entry.get("hex") and entry.get("ncs_code")
+    }
+
     logger.info(
         f"Request: width={width_m}, height={height_m}, "
         f"banderoll={banderoll!r} → {banderoll_bool}, "
         f"skip_colors={skip_colors!r} → {skip_colors_bool}, "
-        f"ruta_nedre={ruta_nedre!r} → {ruta_nedre_bool}"
+        f"ruta_nedre={ruta_nedre!r} → {ruta_nedre_bool}, "
+        f"colour_map={len(colour_map_dict)} entries"
     )
 
     pdf_bytes = await file.read()
@@ -48,7 +64,8 @@ async def slice_pdf(
         height_m,
         banderoll=banderoll_bool,
         skip_colors=skip_colors_bool,
-        ruta_nedre=ruta_nedre_bool
+        ruta_nedre=ruta_nedre_bool,
+        colour_map=colour_map_dict
     )
 
     return {
