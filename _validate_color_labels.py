@@ -23,7 +23,7 @@ import slicer
 
 PDF        = "strip-15 test.pdf"
 PAGE_INDEX = 1
-OUT_PNG    = "color_labels_validation.png"
+OUT_PNG    = "validation/color_labels_validation.png"
 PNG_SCALE  = 10.0   # high-res render purely for human review
 
 DUMMY_MAP = {
