@@ -45,8 +45,10 @@ PINK_PAD_R, PINK_PAD_G, PINK_PAD_B = 0.957, 0.565, 0.710  # ≈ #F490B5
 # ── Color labeling (map-driven, pixel-based) ───────────────────────────────────
 # Rebuilt pipeline. Operates on each already-rendered, already-sliced strip page
 # (post-rotation). All four knobs below are tunable.
-ENABLE_COLOR_LABELS   = True   # Master switch — set False to disable color labeling
-                               # globally without needing "inga färger" in every subject
+ENABLE_COLOR_LABELS   = False  # Master switch — MUST stay False until color labeling
+                               # is fully validated and explicitly approved (TIF-27).
+                               # Validation harnesses call _label_colors_on_page
+                               # directly and are unaffected by this switch.
 COLOR_MATCH_TOLERANCE = 28     # RGB Euclidean distance for matching a mapped color
                                # (handles render drift, same idea as pink/orange bands)
 MIN_PATCH_PX          = 20     # discard connected components smaller than this many
