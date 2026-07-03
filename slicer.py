@@ -51,10 +51,14 @@ ENABLE_COLOR_LABELS   = False  # Master switch — MUST stay False until color l
                                # directly and are unaffected by this switch.
 COLOR_MATCH_TOLERANCE = 28     # RGB Euclidean distance for matching a mapped color
                                # (handles render drift, same idea as pink/orange bands)
-MIN_PATCH_PX          = 20     # discard connected components smaller than this many
-                               # pixels at LABEL_RENDER_SCALE. Tuned on strip-15 page 2:
-                               # 20 recovers thin real blade segments (>=22px) while still
-                               # rejecting <=8px anti-alias edge dust (clean gap 8..22).
+MIN_PATCH_PX          = 10     # discard connected components smaller than this many
+                               # pixels at LABEL_RENDER_SCALE. Strip-15 page 2 gave a
+                               # clean dust/real gap of 8..22 (edge dust <=8px, thin real
+                               # blade segments >=22px). ENAD strip 4 page 1 then showed a
+                               # clearly visible ~19x7cm sliver whose thin ends anti-alias
+                               # away, leaving only 10 in-tolerance px — so the threshold
+                               # sits at 10: still above the 8px dust ceiling, low enough
+                               # to label every patch a painter can actually see.
 LABEL_RENDER_SCALE    = 2.0    # pixmap render scale used for color analysis
 
 # Font size is proportional to each patch's largest-inscribed-circle radius (the
