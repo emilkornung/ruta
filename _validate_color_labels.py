@@ -6,14 +6,13 @@ straight into slicer._label_colors_on_page.
 Run:  python _validate_color_labels.py
 
 Validates on 'strip-15 test.pdf', page index 1:
-  1. The 5 non-skip colors each get labeled on every real patch (incl. the pale
-     sage wisps, ~131-194px).
+  1. The 5 non-skip colors each get a label on every real patch, or an
+     explicitly counted skip (collision) — nothing dropped silently.
   2. No labels land on tiny noise fragments (< MIN_PATCH_PX).
-  3. Every label sits inside its own color, never a neighbor:
-       - pairwise color distances exceed 2*COLOR_MATCH_TOLERANCE (disjoint bands)
-       - each placed label's deepest point is within tolerance of its own color
-         and of NO other mapped color.
-  4. Renders the labeled page to color_labels_validation.png in the repo.
+  3. Every FITTED label's full glyph bbox lies inside its own color's mask
+     (the round-2 fit guarantee); overflow placements are reported.
+  4. No two placed label bboxes intersect (collision avoidance).
+  5. Renders the labeled page to validation/color_labels_validation.png.
 """
 import numpy as np
 import fitz
@@ -61,73 +60,70 @@ doc  = fitz.open(PDF)
 page = doc[PAGE_INDEX]
 summary = slicer._label_colors_on_page(page, DUMMY_MAP)
 
-def n_labeled(h):
-    return summary.get(h, {}).get("count", 0)
-
-print("\nLabels placed per color (with font sizes used):")
+print("\nLabels per color (fs range | fitted/overflow/skipped):")
 for h, c in non_skip:
-    fss = summary.get(h, {}).get("font_sizes", [])
-    rng = f"  fs {min(fss):.2f}..{max(fss):.2f}" if fss else ""
-    print(f"  {h} ({c}): {n_labeled(h)}{rng}")
+    e   = summary.get(h, {})
+    fss = e.get("font_sizes", [])
+    rng = f"fs {min(fss):.2f}..{max(fss):.2f}" if fss else "-"
+    print(f"  {h} ({c}): {e.get('count', 0)} placed  {rng}  "
+          f"overflow={e.get('overflow', 0)}  skipped={e.get('skipped', 0)}")
 
-# ── 3. Independent placement-correctness check ──────────────────────────────────
-# Re-derive each patch's deepest point on a CLEAN pixmap and confirm it is within
-# tolerance of its own color and of no other mapped color.
+# ── 3. Independent checks on a CLEAN pixmap ─────────────────────────────────────
 clean = fitz.open(PDF)[PAGE_INDEX]
-pix   = clean.get_pixmap(matrix=fitz.Matrix(slicer.LABEL_RENDER_SCALE,
-                                            slicer.LABEL_RENDER_SCALE),
-                         colorspace=fitz.csRGB)
+S     = slicer.LABEL_RENDER_SCALE
+pix   = clean.get_pixmap(matrix=fitz.Matrix(S, S), colorspace=fitz.csRGB)
 arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
 arr = arr[:, :, :3].astype(np.int32)
 tol_sq = slicer.COLOR_MATCH_TOLERANCE ** 2
 
-all_inside_own   = True
-none_in_neighbor = True
-expected_counts  = {}
-noise_protected  = True
-
+# 3a. Coverage: every real patch labeled or explicitly skipped.
+coverage_ok = True
+print("\nExpected real patches (>= MIN_PATCH_PX) vs placed+skipped:")
 for h, c in non_skip:
-    target  = rgb(h)
-    mask    = ((arr - target) ** 2).sum(axis=2) <= tol_sq
-    lbl, n  = ndimage.label(mask)
-    counts  = np.bincount(lbl.ravel())
-    objects = ndimage.find_objects(lbl)
-    n_real  = int((counts[1:] >= slicer.MIN_PATCH_PX).sum())
-    expected_counts[h] = n_real
+    mask   = ((arr - rgb(h)) ** 2).sum(axis=2) <= tol_sq
+    lbl, n = ndimage.label(mask)
+    counts = np.bincount(lbl.ravel())
+    exp    = int((counts[1:] >= slicer.MIN_PATCH_PX).sum())
+    e      = summary.get(h, {})
+    got    = e.get("count", 0) + e.get("skipped", 0)
+    ok     = exp == got
+    coverage_ok &= ok
+    print(f"  {h} ({c}): expected {exp}, placed {e.get('count', 0)} "
+          f"+ skipped {e.get('skipped', 0)}  {'OK' if ok else 'MISMATCH'}")
 
-    for comp in range(1, n + 1):
-        if counts[comp] < slicer.MIN_PATCH_PX:
+# 3b. Fitted labels: full glyph bbox inside the label's own color mask.
+fit_inside_own = True
+n_fit = n_ovf = 0
+for h, c in non_skip:
+    e    = summary.get(h, {})
+    mask = ((arr - rgb(h)) ** 2).sum(axis=2) <= tol_sq
+    for rect, kind in zip(e.get("rects", []), e.get("placement", [])):
+        if kind != "fit":
+            n_ovf += 1
             continue
-        sl   = objects[comp - 1]
-        sub  = lbl[sl] == comp
-        dt   = ndimage.distance_transform_edt(sub)
-        yloc, xloc = np.unravel_index(int(np.argmax(dt)), dt.shape)
-        yi, xi = sl[0].start + yloc, sl[1].start + xloc
-        px = arr[yi, xi]
+        n_fit += 1
+        x0, y0 = int(np.floor(rect[0] * S)), int(np.floor(rect[1] * S))
+        x1, y1 = int(np.ceil(rect[2] * S)),  int(np.ceil(rect[3] * S))
+        if not mask[max(0, y0):y1, max(0, x0):x1].all():
+            fit_inside_own = False
+            print(f"  BBOX ESCAPES OWN COLOR: {c} at {rect}")
 
-        own = float(np.linalg.norm(px - target))
-        if own > slicer.COLOR_MATCH_TOLERANCE:
-            all_inside_own = False
-        for h2, c2 in non_skip:
-            if h2 == h:
-                continue
-            if float(np.linalg.norm(px - rgb(h2))) <= slicer.COLOR_MATCH_TOLERANCE:
-                none_in_neighbor = False
+# 3c. No two placed label bboxes intersect.
+all_rects = [fitz.Rect(*r) for h, _ in non_skip
+             for r in summary.get(h, {}).get("rects", [])]
+no_collisions = True
+for i in range(len(all_rects)):
+    for j in range(i + 1, len(all_rects)):
+        if all_rects[i].intersects(all_rects[j]):
+            no_collisions = False
+            print(f"  LABEL COLLISION: {all_rects[i]} vs {all_rects[j]}")
 
-print("\nExpected real patches (>= MIN_PATCH_PX) vs labeled:")
-for h, c in non_skip:
-    exp, got = expected_counts[h], n_labeled(h)
-    ok = exp == got
-    noise_protected &= ok
-    print(f"  {h} ({c}): expected {exp}, labeled {got}  {'OK' if ok else 'MISMATCH'}")
-
-# Aggregate font-size range actually used (for tuning factor / min / max).
 all_fs = [f for h, _ in non_skip for f in summary.get(h, {}).get("font_sizes", [])]
 if all_fs:
     n_at_min = sum(1 for f in all_fs if abs(f - slicer.LABEL_FONT_MIN) < 1e-6)
     n_at_max = sum(1 for f in all_fs if abs(f - slicer.LABEL_FONT_MAX) < 1e-6)
     print(f"\nFont sizes used across ALL labels: min {min(all_fs):.2f}  "
-          f"max {max(all_fs):.2f}  (n={len(all_fs)})")
+          f"max {max(all_fs):.2f}  (n={len(all_fs)}, fitted={n_fit}, overflow={n_ovf})")
     print(f"  clamped at floor ({slicer.LABEL_FONT_MIN}): {n_at_min}   "
           f"clamped at ceiling ({slicer.LABEL_FONT_MAX}): {n_at_max}   "
           f"factor={slicer.LABEL_FONT_FACTOR}")
@@ -138,18 +134,17 @@ out_pix.save(OUT_PNG)
 print(f"\nSaved labeled render -> {OUT_PNG}  ({out_pix.width}x{out_pix.height})")
 
 # ── Verdict ─────────────────────────────────────────────────────────────────────
-# Required checks: what the task actually demands of the labeling.
 print("\n=== REQUIRED CHECKS ===")
-print(f"  every real patch labeled, no noise labeled: {noise_protected}")
-print(f"  each label inside its OWN color:            {all_inside_own}")
-print(f"  no label inside a NEIGHBOR color:           {none_in_neighbor}")
-ok = noise_protected and all_inside_own and none_in_neighbor
+print(f"  every real patch placed or counted skip:    {coverage_ok}")
+print(f"  fitted label bboxes inside their OWN color: {fit_inside_own}")
+print(f"  no label-vs-label bbox collisions:          {no_collisions}")
+ok = coverage_ok and fit_inside_own and no_collisions
 print(f"  REQUIRED CHECKS PASS: {ok}")
 
 # Diagnostic only: with these specific map colors some bands nearly touch
-# (e.g. #0E6B38 vs #0D5128 = 30.5). Placement still lands correctly because the
-# deepest-interior-point sits in the pure-color core, away from any overlap edge.
-# Surfaced here for MIN_PATCH_PX / COLOR_MATCH_TOLERANCE tuning, not a pass/fail.
+# (e.g. #0E6B38 vs #0D5128 = 30.5). Placement still lands correctly because
+# fit verification runs against each patch's own mask. Surfaced here for
+# MIN_PATCH_PX / COLOR_MATCH_TOLERANCE tuning, not a pass/fail.
 print("\n=== DIAGNOSTIC ===")
 print(f"  tolerance bands fully disjoint:             {bands_disjoint}"
       f"  (min pairwise dist {min_pair:.1f} vs 2*tol {2 * slicer.COLOR_MATCH_TOLERANCE})")

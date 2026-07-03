@@ -179,8 +179,25 @@ def _label_colors_on_page(page, color_map):
          of the patch's largest inscribed circle) so the label fits its patch,
          clamped to [LABEL_FONT_MIN, LABEL_FONT_MAX].
 
-    Returns {hex_c: {"count": n, "font_sizes": [...]}} for inspection/validation.
-    The slicing path ignores the return value.
+    Placement/sizing per patch (fit-verified, collision-aware):
+      - The label's FULL rendered bbox must lie inside the patch's own mask
+        (checked with a minimum_filter erosion), not just "the patch is big
+        enough on average" — fixes labels bleeding out of thin strips and
+        narrowing wedges. Sizes are tried from the radius-derived candidate
+        down to LABEL_FONT_MIN; the position is the deepest interior point
+        among centers where the bbox fits.
+      - Labels already placed on the page (any color) are collision-checked;
+        candidate centers whose bbox would overlap one are excluded. Patches
+        are placed largest-first so sliver clusters yield to big neighbours.
+      - If no fitting position exists even at floor size (patch thinner than
+        the text), coverage wins: the label goes at the deepest interior
+        point at floor size, page-clamped ("overflow"). If that spot would
+        sit on an existing label, the patch is skipped — counted in the
+        summary, never dropped silently.
+
+    Returns {hex_c: {"count", "font_sizes", "rects", "overflow", "skipped"}}
+    for inspection/validation ("rects" are glyph bboxes in page points,
+    aligned with "font_sizes"). The slicing path ignores the return value.
     """
     summary = {}
 
@@ -197,7 +214,10 @@ def _label_colors_on_page(page, color_map):
     arr = arr[:, :, :3].astype(np.int32)
 
     tol_sq = COLOR_MATCH_TOLERANCE ** 2
+    S      = LABEL_RENDER_SCALE
 
+    # ── Pass 1: collect every labelable patch across all mapped colors ─────
+    patches = []
     for hex_c, code in color_map.items():
         if not code or code == "Skip":
             continue
@@ -205,11 +225,9 @@ def _label_colors_on_page(page, color_map):
         if target is None:
             continue
 
-        dist_sq = ((arr - target) ** 2).sum(axis=2)
-        mask    = dist_sq <= tol_sq
+        mask = ((arr - target) ** 2).sum(axis=2) <= tol_sq
         if not mask.any():
             continue
-
         lbl, num = ndimage.label(mask)
         if num == 0:
             continue
@@ -218,59 +236,129 @@ def _label_colors_on_page(page, color_map):
         objects = ndimage.find_objects(lbl)
         text_color = _text_color_for((target[0] / 255, target[1] / 255, target[2] / 255))
 
-        placed     = 0
-        font_sizes = []
         for comp in range(1, num + 1):
             if counts[comp] < MIN_PATCH_PX:
                 continue
-
             sl       = objects[comp - 1]
             sub_mask = lbl[sl] == comp
-            # Deepest interior point of THIS patch — guaranteed inside the region.
             # Pad by 1px so the pixmap/page edge counts as a patch boundary:
             # without it, EDT overestimates the inscribed radius of patches
-            # clipped by the page edge and can place the "deepest" point right
-            # ON the edge (labels sized too big and cut in half at page edges).
-            dt       = ndimage.distance_transform_edt(np.pad(sub_mask, 1))[1:-1, 1:-1]
-            yloc, xloc = np.unravel_index(int(np.argmax(dt)), dt.shape)
-            yi = sl[0].start + yloc
-            xi = sl[1].start + xloc
+            # clipped by the page edge (and of patches exactly filling their
+            # bbox, which have no background pixels in the sub-mask at all).
+            dt = ndimage.distance_transform_edt(np.pad(sub_mask, 1))[1:-1, 1:-1]
+            patches.append((int(counts[comp]), hex_c, code, sl, sub_mask, dt, text_color))
 
-            # Font size from the patch's inscribed-circle radius (max dt value),
-            # converted from analysis pixels to PDF points. Small patches → small
-            # labels; big patches → larger labels.
-            inscribed_pts = float(dt[yloc, xloc]) / LABEL_RENDER_SCALE
-            fs_radius     = inscribed_pts * LABEL_FONT_FACTOR
+    # Largest patches place first: in dense clusters the slivers yield to
+    # (shrink/shift/skip around) their big neighbours, not the reverse.
+    patches.sort(key=lambda p: -p[0])
 
-            # Width cap: the whole word, centered, must fit within the inscribed
-            # circle's diameter, so multi-char / long codes can't overflow sideways
-            # into a neighbouring colour. width(fs) scales linearly with fs.
-            wpp     = fitz.get_text_length(code, fontname="helv", fontsize=1.0)
-            fs_width = (2 * inscribed_pts) / wpp if wpp else fs_radius
+    placed_rects = []   # finalized glyph bboxes incl. margin (page points)
+    MARGIN       = 0.5  # pt clearance required between labels
 
-            fs = max(LABEL_FONT_MIN, min(LABEL_FONT_MAX, min(fs_radius, fs_width)))
+    for npx, hex_c, code, sl, sub_mask, dt, text_color in patches:
+        entry = summary.setdefault(
+            hex_c, {"count": 0, "font_sizes": [], "rects": [], "placement": [],
+                    "overflow": 0, "skipped": 0})
 
-            # Pixel (center) → PDF point coordinates.
-            px = (xi + 0.5) / LABEL_RENDER_SCALE
-            py = (yi + 0.5) / LABEL_RENDER_SCALE
+        r_pts = float(dt.max()) / S
+        wpp   = fitz.get_text_length(code, fontname="helv", fontsize=1.0) or 1.0
+        # Radius-derived size (round-1 behaviour) is the starting candidate.
+        fs0 = max(LABEL_FONT_MIN,
+                  min(LABEL_FONT_MAX, min(r_pts * LABEL_FONT_FACTOR, 2 * r_pts / wpp)))
+        sizes = sorted({round(f, 2) for f in np.linspace(fs0, LABEL_FONT_MIN, 4)},
+                       reverse=True)
 
-            # Center the glyphs on the deepest point so they stay inside the patch.
-            # Floor-clamped labels (fs > patch radius) can overhang a page edge
-            # and get truncated in print; nudge those back fully onto the page.
-            # Codes are digits/short words (no descenders), so the glyphs span
-            # ~0.72*fs above the baseline and ~0 below.
-            tw      = fitz.get_text_length(code, fontname="helv", fontsize=fs)
-            ox      = min(max(px - tw / 2, 0.5), page.rect.width - tw - 0.5)
-            oy      = min(max(py + fs * 0.35, fs * 0.72 + 0.5), page.rect.height - 0.5)
-            origin  = fitz.Point(ox, oy)
-            page.insert_text(origin, code, fontsize=fs, color=text_color)
-            placed += 1
-            font_sizes.append(round(fs, 2))
+        chosen = None
+        for fs in sizes:
+            tw   = wpp * fs
+            hh   = 0.72 * fs   # glyph height: digits/short words, no descenders
+            w_px = int(np.ceil(tw * S)) + 1
+            h_px = int(np.ceil(hh * S)) + 1
+            if w_px > sub_mask.shape[1] or h_px > sub_mask.shape[0]:
+                continue
+            # Centers where the label's full bbox lies inside the patch mask.
+            # mode="constant" makes anything outside the bbox count as non-fit,
+            # which also keeps fitted labels fully on the page.
+            fit = ndimage.minimum_filter(
+                sub_mask.astype(np.uint8), size=(h_px, w_px),
+                mode="constant", cval=0).astype(bool)
+            if not fit.any():
+                continue
+            if placed_rects:
+                # Exclude centers whose bbox would overlap an existing label.
+                for R in placed_rects:
+                    ex0 = int(np.floor((R.x0 - tw / 2) * S)) - sl[1].start
+                    ex1 = int(np.ceil((R.x1 + tw / 2) * S)) - sl[1].start
+                    ey0 = int(np.floor((R.y0 - hh / 2) * S)) - sl[0].start
+                    ey1 = int(np.ceil((R.y1 + hh / 2) * S)) - sl[0].start
+                    if ex1 <= 0 or ey1 <= 0 or ex0 >= fit.shape[1] or ey0 >= fit.shape[0]:
+                        continue
+                    fit[max(0, ey0):ey1, max(0, ex0):ex1] = False
+                if not fit.any():
+                    continue
+            # Best-fitting position: deepest interior point among valid centers.
+            yloc, xloc = np.unravel_index(int(np.argmax(np.where(fit, dt, -1.0))),
+                                          fit.shape)
+            chosen = (fs, yloc, xloc)
+            break
 
-        if placed:
-            summary[hex_c] = {"count": placed, "font_sizes": font_sizes}
+        overflow = False
+        if chosen is None:
+            # Nothing fits even at floor size (patch thinner than the text) or
+            # every fitting position collides. Coverage fallback: a floor-size
+            # label anchored to the deepest NON-COLLIDING point of the patch
+            # (the text may overhang the patch — unavoidable when the patch is
+            # thinner than readable text — but never another label). Only if
+            # every anchor point collides is the patch skipped, and counted.
+            fs = LABEL_FONT_MIN
+            tw = wpp * fs
+            hh = 0.72 * fs
+            cand = sub_mask.copy()
+            for R in placed_rects:
+                ex0 = int(np.floor((R.x0 - tw / 2) * S)) - sl[1].start
+                ex1 = int(np.ceil((R.x1 + tw / 2) * S)) - sl[1].start
+                ey0 = int(np.floor((R.y0 - hh / 2) * S)) - sl[0].start
+                ey1 = int(np.ceil((R.y1 + hh / 2) * S)) - sl[0].start
+                if ex1 <= 0 or ey1 <= 0 or ex0 >= cand.shape[1] or ey0 >= cand.shape[0]:
+                    continue
+                cand[max(0, ey0):ey1, max(0, ex0):ex1] = False
+            if not cand.any():
+                entry["skipped"] += 1
+                continue
+            yloc, xloc = np.unravel_index(int(np.argmax(np.where(cand, dt, -1.0))),
+                                          cand.shape)
+            px = (sl[1].start + xloc + 0.5) / S
+            py = (sl[0].start + yloc + 0.5) / S
+            ox = min(max(px - tw / 2, 0.5), page.rect.width - tw - 0.5)
+            oy = min(max(py + fs * 0.35, hh + 0.5), page.rect.height - 0.5)
+            rect = fitz.Rect(ox - MARGIN, oy - hh - MARGIN, ox + tw + MARGIN, oy + MARGIN)
+            # The page-edge clamp can nudge the rect into a neighbour that the
+            # anchor-point check could not see — re-verify before drawing.
+            if any(rect.intersects(R) for R in placed_rects):
+                entry["skipped"] += 1
+                continue
+            overflow = True
+        else:
+            fs, yloc, xloc = chosen
+            tw = wpp * fs
+            hh = 0.72 * fs
+            px = (sl[1].start + xloc + 0.5) / S
+            py = (sl[0].start + yloc + 0.5) / S
+            # Fitted bboxes are inside the page by construction; clamp is a no-op.
+            ox = min(max(px - tw / 2, 0.5), page.rect.width - tw - 0.5)
+            oy = min(max(py + fs * 0.35, hh + 0.5), page.rect.height - 0.5)
+            rect = fitz.Rect(ox - MARGIN, oy - hh - MARGIN, ox + tw + MARGIN, oy + MARGIN)
 
-    return summary
+        page.insert_text(fitz.Point(ox, oy), code, fontsize=fs, color=text_color)
+        placed_rects.append(rect)
+        entry["count"]      += 1
+        entry["font_sizes"].append(round(fs, 2))
+        entry["rects"].append((round(ox, 2), round(oy - hh, 2),
+                               round(ox + tw, 2), round(oy, 2)))
+        entry["placement"].append("overflow" if overflow else "fit")
+        entry["overflow"]   += 1 if overflow else 0
+
+    return {h: e for h, e in summary.items() if e["count"] or e["skipped"]}
 
 
 def extract_pdf_colors(pdf_bytes):
