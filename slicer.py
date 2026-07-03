@@ -253,8 +253,14 @@ def _label_colors_on_page(page, color_map):
             py = (yi + 0.5) / LABEL_RENDER_SCALE
 
             # Center the glyphs on the deepest point so they stay inside the patch.
+            # Floor-clamped labels (fs > patch radius) can overhang a page edge
+            # and get truncated in print; nudge those back fully onto the page.
+            # Codes are digits/short words (no descenders), so the glyphs span
+            # ~0.72*fs above the baseline and ~0 below.
             tw      = fitz.get_text_length(code, fontname="helv", fontsize=fs)
-            origin  = fitz.Point(px - tw / 2, py + fs * 0.35)
+            ox      = min(max(px - tw / 2, 0.5), page.rect.width - tw - 0.5)
+            oy      = min(max(py + fs * 0.35, fs * 0.72 + 0.5), page.rect.height - 0.5)
+            origin  = fitz.Point(ox, oy)
             page.insert_text(origin, code, fontsize=fs, color=text_color)
             placed += 1
             font_sizes.append(round(fs, 2))
