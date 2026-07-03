@@ -3,3 +3,6 @@ credentials.json
 __pycache__/
 *.pyc
 .env
+# Bulk validation renders (regenerable via _validate_*.py); key evidence
+# renders are force-added individually.
+validation/
