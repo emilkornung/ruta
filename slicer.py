@@ -225,7 +225,11 @@ def _label_colors_on_page(page, color_map):
             sl       = objects[comp - 1]
             sub_mask = lbl[sl] == comp
             # Deepest interior point of THIS patch — guaranteed inside the region.
-            dt       = ndimage.distance_transform_edt(sub_mask)
+            # Pad by 1px so the pixmap/page edge counts as a patch boundary:
+            # without it, EDT overestimates the inscribed radius of patches
+            # clipped by the page edge and can place the "deepest" point right
+            # ON the edge (labels sized too big and cut in half at page edges).
+            dt       = ndimage.distance_transform_edt(np.pad(sub_mask, 1))[1:-1, 1:-1]
             yloc, xloc = np.unravel_index(int(np.argmax(dt)), dt.shape)
             yi = sl[0].start + yloc
             xi = sl[1].start + xloc
