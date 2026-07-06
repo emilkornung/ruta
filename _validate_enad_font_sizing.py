@@ -24,7 +24,9 @@ DUMMY_MAP = {
     "#72A982": "3020",   # sage
     "#B3C8BB": "1010",   # pale sage
     "#FFFFFF": "Vit",    # white letters / shirts
-    "#EBECE8": "Skip",   # off-white highlight tint
+    "#EBECE8": "Vit",    # off-white highlight tint — near-white maps to Vit,
+                         # never Skip (round-4 rule; was wrongly Skip before).
+                         # Same code as #FFFFFF: _code_masks unions them.
     "#2E251E": "Skip",   # near-black outlines
 }
 

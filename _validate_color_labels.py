@@ -62,9 +62,9 @@ doc  = fitz.open(PDF)
 page = doc[PAGE_INDEX]
 summary = slicer._label_colors_on_page(page, DUMMY_MAP)
 
-print("\nLabels per color (fs range | fitted/forced):")
+print("\nLabels per code (fs range | fitted/forced):")
 for h, c in non_skip:
-    e   = summary.get(h, {})
+    e   = summary.get(c, {})
     fss = e.get("font_sizes", [])
     rng = f"fs {min(fss):.2f}..{max(fss):.2f}" if fss else "-"
     print(f"  {h} ({c}): {e.get('count', 0)} placed  {rng}  "
@@ -78,26 +78,28 @@ arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 
 arr = arr[:, :, :3].astype(np.int32)
 tol_sq = slicer.COLOR_MATCH_TOLERANCE ** 2
 
-# 3a. Zero skips: every real patch gets exactly one label.
+# 3a. Zero skips: every real patch gets exactly one label. Recount uses the
+# same nearest-color / per-code mask semantics as the labeler.
+code_masks = slicer._code_masks(arr, DUMMY_MAP)
 zero_skips = True
 print("\nExpected real patches (>= MIN_PATCH_PX) vs placed:")
 for h, c in non_skip:
-    mask   = ((arr - rgb(h)) ** 2).sum(axis=2) <= tol_sq
+    mask   = code_masks.get(c, np.zeros(arr.shape[:2], dtype=bool))
     lbl, n = ndimage.label(mask)
     counts = np.bincount(lbl.ravel())
     exp    = int((counts[1:] >= slicer.MIN_PATCH_PX).sum())
-    got    = summary.get(h, {}).get("count", 0)
+    got    = summary.get(c, {}).get("count", 0)
     ok     = exp == got
     zero_skips &= ok
     print(f"  {h} ({c}): expected {exp}, placed {got}  {'OK' if ok else 'MISMATCH'}")
 
-# 3b. Fitted labels: glyph bbox inside the label's own color mask. For rects
+# 3b. Fitted labels: glyph bbox inside the label's own code mask. For rects
 # smaller than the analysis pixel grid, the center pixel is the honest test.
 fit_inside_own = True
 n_fit = n_forced = 0
 for h, c in non_skip:
-    e    = summary.get(h, {})
-    mask = ((arr - rgb(h)) ** 2).sum(axis=2) <= tol_sq
+    e    = summary.get(c, {})
+    mask = code_masks.get(c, np.zeros(arr.shape[:2], dtype=bool))
     for rect, kind in zip(e.get("rects", []), e.get("placement", [])):
         if kind != "fit":
             n_forced += 1
@@ -118,8 +120,8 @@ for h, c in non_skip:
 
 # 3c. No two placed label bboxes intersect (forced placements excluded).
 all_rects = []
-for h, _ in non_skip:
-    e = summary.get(h, {})
+for _, c in non_skip:
+    e = summary.get(c, {})
     for rect, kind in zip(e.get("rects", []), e.get("placement", [])):
         if kind == "fit":
             all_rects.append(fitz.Rect(*rect))
@@ -130,7 +132,7 @@ for i in range(len(all_rects)):
             no_collisions = False
             print(f"  LABEL COLLISION: {all_rects[i]} vs {all_rects[j]}")
 
-all_fs = [f for h, _ in non_skip for f in summary.get(h, {}).get("font_sizes", [])]
+all_fs = [f for _, c in non_skip for f in summary.get(c, {}).get("font_sizes", [])]
 if all_fs:
     n_default = sum(1 for f in all_fs if abs(f - slicer.LABEL_FONT_DEFAULT) < 1e-6)
     n_floor   = sum(1 for f in all_fs if f <= slicer.LABEL_FONT_TECH_MIN + 1e-6)

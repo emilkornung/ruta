@@ -48,28 +48,24 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None):
     t0 = time.time()
 
     real_label = slicer._label_colors_on_page
-    tol_sq = slicer.COLOR_MATCH_TOLERANCE ** 2
-    S      = slicer.LABEL_RENDER_SCALE
+    S = slicer.LABEL_RENDER_SCALE
 
     def recording_label(page, color_map):
         nonlocal expected_total, placed_total
         # Independent recount of labelable patches on the clean page (before
         # any text lands on it) — this is what "zero skips" is checked against.
+        # Uses the same nearest-color / per-code mask semantics as the labeler.
         pix = page.get_pixmap(matrix=fitz.Matrix(S, S), colorspace=fitz.csRGB)
         arr = np.frombuffer(pix.samples, dtype=np.uint8) \
                 .reshape(pix.height, pix.width, pix.n)[:, :, :3].astype(np.int32)
-        for hex_c, code in color_map.items():
-            if not code or code == "Skip":
-                continue
-            mask = ((arr - slicer._hex_to_rgb255(hex_c)) ** 2).sum(axis=2) <= tol_sq
-            if mask.any():
-                lbl, _ = ndimage.label(mask)
-                counts = np.bincount(lbl.ravel())
-                expected_total += int((counts[1:] >= slicer.MIN_PATCH_PX).sum())
+        for code, mask in slicer._code_masks(arr, color_map).items():
+            lbl, _ = ndimage.label(mask)
+            counts = np.bincount(lbl.ravel())
+            expected_total += int((counts[1:] >= slicer.MIN_PATCH_PX).sum())
 
         summary = real_label(page, color_map)
-        for hex_c, e in summary.items():
-            t = totals.setdefault(color_map[hex_c], [0, 0, 0])
+        for code, e in summary.items():
+            t = totals.setdefault(code, [0, 0, 0])
             t[0] += e["count"]
             t[1] += e["placement"].count("fit")
             t[2] += e["forced"]

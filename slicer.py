@@ -168,6 +168,52 @@ def _hex_to_rgb255(hex_c):
         return None
 
 
+def _code_masks(arr, color_map):
+    """
+    Assign every pixel to its NEAREST mapped color (within tolerance), then
+    union the masks of hexes sharing a paint code.
+
+    Nearest-only assignment is the round-4 fix for fragmented double labels:
+    with independent per-hex tolerance bands, two mapped colors closer than
+    2*COLOR_MATCH_TOLERANCE both claimed the same physical fill's pixels, so
+    one shape formed a component in TWO masks and received two different
+    code labels. Per-code unions additionally merge hexes that map to the
+    same code (e.g. #FFFFFF and an off-white both -> "Vit") into a single
+    connected component instead of adjacent duplicate labels.
+
+    "Skip" entries participate in the assignment (they own their pixels, so
+    near-black outline pixels can't leak into a neighbouring code's mask)
+    but are excluded from the returned masks.
+
+    Returns {code: bool mask}. Shared with the validation harnesses so the
+    expected-patch recount uses identical semantics.
+    """
+    reps = []
+    for hex_c, code in color_map.items():
+        if not code:
+            continue
+        rgb = _hex_to_rgb255(hex_c)
+        if rgb is not None:
+            reps.append((code, rgb))
+    if not reps:
+        return {}
+
+    dist = np.stack([((arr - rgb) ** 2).sum(axis=2) for _, rgb in reps])
+    nearest = np.argmin(dist, axis=0)
+    within  = np.min(dist, axis=0) <= COLOR_MATCH_TOLERANCE ** 2
+
+    masks = {}
+    for k, (code, _) in enumerate(reps):
+        if code == "Skip":
+            continue
+        m = (nearest == k) & within
+        if code in masks:
+            masks[code] |= m
+        else:
+            masks[code] = m
+    return {c: m for c, m in masks.items() if m.any()}
+
+
 def _label_colors_on_page(page, color_map):
     """
     Map-driven, pixel-based color labeling for a single rendered strip page.
@@ -198,10 +244,11 @@ def _label_colors_on_page(page, color_map):
         still inside its own patch, may touch another label) and counted, so
         a zero-space cluster is visible in the summary rather than silent.
 
-    Returns {hex_c: {"count", "font_sizes", "rects", "placement", "forced"}}
+    Returns {code: {"count", "font_sizes", "rects", "placement", "forced"}}
     for inspection/validation ("rects" are glyph bboxes in page points,
     aligned with "font_sizes"; "placement" entries are "fit"/"forced").
-    The slicing path ignores the return value.
+    Keyed by paint CODE (not hex) since round 4. The slicing path ignores
+    the return value.
     """
     summary = {}
 
@@ -217,28 +264,25 @@ def _label_colors_on_page(page, color_map):
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(ph, pw, pix.n)
     arr = arr[:, :, :3].astype(np.int32)
 
-    tol_sq = COLOR_MATCH_TOLERANCE ** 2
-    S      = LABEL_RENDER_SCALE
+    S = LABEL_RENDER_SCALE
 
-    # ── Pass 1: collect every labelable patch across all mapped colors ─────
-    patches = []
+    # ── Pass 1: collect every labelable patch, one mask per paint code ─────
+    # Nearest-color assignment + per-code unions (see _code_masks) so one
+    # physical patch can only ever be one component in one mask.
+    code_text_color = {}
     for hex_c, code in color_map.items():
-        if not code or code == "Skip":
-            continue
-        target = _hex_to_rgb255(hex_c)
-        if target is None:
-            continue
+        rgb = _hex_to_rgb255(hex_c)
+        if code and code != "Skip" and rgb is not None and code not in code_text_color:
+            code_text_color[code] = _text_color_for(
+                (rgb[0] / 255, rgb[1] / 255, rgb[2] / 255))
 
-        mask = ((arr - target) ** 2).sum(axis=2) <= tol_sq
-        if not mask.any():
-            continue
+    patches = []
+    for code, mask in _code_masks(arr, color_map).items():
         lbl, num = ndimage.label(mask)
         if num == 0:
             continue
-
         counts  = np.bincount(lbl.ravel())
         objects = ndimage.find_objects(lbl)
-        text_color = _text_color_for((target[0] / 255, target[1] / 255, target[2] / 255))
 
         for comp in range(1, num + 1):
             if counts[comp] < MIN_PATCH_PX:
@@ -250,7 +294,8 @@ def _label_colors_on_page(page, color_map):
             # clipped by the page edge (and of patches exactly filling their
             # bbox, which have no background pixels in the sub-mask at all).
             dt = ndimage.distance_transform_edt(np.pad(sub_mask, 1))[1:-1, 1:-1]
-            patches.append((int(counts[comp]), hex_c, code, sl, sub_mask, dt, text_color))
+            patches.append((int(counts[comp]), code, sl, sub_mask, dt,
+                            code_text_color[code]))
 
     # Largest patches place first: in dense clusters the slivers yield to
     # (shrink/shift/skip around) their big neighbours, not the reverse.
@@ -259,10 +304,10 @@ def _label_colors_on_page(page, color_map):
     placed_rects = []   # finalized glyph bboxes incl. margin (page points)
     MARGIN       = 0.5  # pt clearance required between labels
 
-    for npx, hex_c, code, sl, sub_mask, dt, text_color in patches:
+    for npx, code, sl, sub_mask, dt, text_color in patches:
         entry = summary.setdefault(
-            hex_c, {"count": 0, "font_sizes": [], "rects": [], "placement": [],
-                    "forced": 0})
+            code, {"count": 0, "font_sizes": [], "rects": [], "placement": [],
+                   "forced": 0})
 
         r_pts = float(dt.max()) / S
         wpp   = fitz.get_text_length(code, fontname="helv", fontsize=1.0) or 1.0
