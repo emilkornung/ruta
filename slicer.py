@@ -73,6 +73,17 @@ LABEL_FONT_TECH_MIN   = 0.1    # pt — technical safety floor only (guards agai
                                # judgment; hitting it is reported ("forced") and
                                # means a patch held text in near-zero space.
 
+# Page-number exclusion zone (TIF-27 round 5, restores the legacy ruta.py
+# labeler's dead zone in rect form). The orange page number is inserted AFTER
+# labeling (see slice_one_strip: baseline (width-12, 10), fontsize 6, 1-2
+# digits), so the labeler can't see it in the pixmap — its known footprint is
+# reserved instead by seeding placed_rects. Fitted labels shrink/shift around
+# it like around any other label; forced placements may still enter it (zero
+# skips outranks the dead zone, the operator handles that corner manually).
+PAGE_NUM_EXCL_W  = 13.5  # pt reserved leftward from the right page edge
+PAGE_NUM_EXCL_Y0 = 4.0   # pt from the top edge (glyph top ≈ 5.7 minus pad)
+PAGE_NUM_EXCL_Y1 = 11.5  # pt from the top edge (baseline 10 plus pad)
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def is_fully_background(src_doc, src_page_num, clip):
@@ -301,7 +312,11 @@ def _label_colors_on_page(page, color_map):
     # (shrink/shift/skip around) their big neighbours, not the reverse.
     patches.sort(key=lambda p: -p[0])
 
-    placed_rects = []   # finalized glyph bboxes incl. margin (page points)
+    # Seeded with the page number's reserved rect so fitted labels avoid the
+    # spot where slice_one_strip will draw it after labeling.
+    placed_rects = [fitz.Rect(page.rect.width - PAGE_NUM_EXCL_W,
+                              PAGE_NUM_EXCL_Y0,
+                              page.rect.width, PAGE_NUM_EXCL_Y1)]
     MARGIN       = 0.5  # pt clearance required between labels
 
     for npx, code, sl, sub_mask, dt, text_color in patches:
