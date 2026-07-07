@@ -39,4 +39,7 @@ DUMMY_MAP = {
 
 if __name__ == "__main__":
     strips = [int(a) - 1 for a in sys.argv[1:]] or None
-    run_design("kenta.pdf", 21, 20, DUMMY_MAP, "kenta", strips)
+    # Strips 3 and 8 export as vector PDFs (multi-page): the strips behind the
+    # tracked evidence renders, incl. the strip-8 eyelash forced-label cluster.
+    run_design("kenta.pdf", 21, 20, DUMMY_MAP, "kenta", strips,
+               pdf_strips={3, 8})

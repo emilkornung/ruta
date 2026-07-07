@@ -6,8 +6,11 @@ slicing + labeling path end to end.
 
 Used by _validate_enad_font_sizing.py and _validate_kenta_font_sizing.py.
 
-Renders every labeled strip page to validation/<prefix>_strip<N>_p<M>.png and
-reports, per code and overall: labels placed, fitted vs forced (a "forced"
+Renders every labeled strip page to validation/<prefix>_strip<N>_p<M>.png.
+Strips listed in pdf_strips are additionally exported as labeled vector PDFs
+(validation/<prefix>_strip<N>.pdf — the exact bytes production would upload),
+so output can be reviewed at real print scale rather than as raster.
+Reports, per code and overall: labels placed, fitted vs forced (a "forced"
 placement means even sub-pixel text had no collision-free pixel — worth
 knowing about, it flags a zero-space cluster), the font-size distribution,
 and how many labels sat at the technical floor LABEL_FONT_TECH_MIN.
@@ -27,7 +30,8 @@ PNG_SCALE = 8.0
 OUT_DIR   = "validation"
 
 
-def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None):
+def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
+               pdf_strips=()):
     num_strips = math.ceil(width_m / slicer.STRIP_WIDTH_M)
     num_pages  = math.ceil(height_m / slicer.PAGE_HEIGHT_M)
     strips     = strips if strips is not None else list(range(num_strips))
@@ -79,6 +83,11 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None):
             strip_num, strip_bytes = slicer.slice_one_strip(
                 (s, pdf_bytes, width_m, height_m, num_strips, num_pages,
                  dummy_map, False))
+            if strip_num in pdf_strips:
+                # Actual labeled vector output (what production would upload),
+                # for reviewing text at real print scale instead of raster.
+                with open(f"{OUT_DIR}/{prefix}_strip{strip_num}.pdf", "wb") as fh:
+                    fh.write(strip_bytes)
             out = fitz.open(stream=strip_bytes, filetype="pdf")
             for pi, pg in enumerate(out):
                 pg.get_pixmap(matrix=fitz.Matrix(PNG_SCALE, PNG_SCALE),

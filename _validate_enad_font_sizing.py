@@ -32,4 +32,7 @@ DUMMY_MAP = {
 
 if __name__ == "__main__":
     strips = [int(a) - 1 for a in sys.argv[1:]] or None
-    run_design("ENAD_rutor.pdf", 61.5, 20, DUMMY_MAP, "enad", strips)
+    # Strip 12 exports as vector PDF: its page 3 is the Vit-heavy dense area
+    # that exposed the round-4 unlabeled-fields issue (EBECE8 wrongly Skip).
+    run_design("ENAD_rutor.pdf", 61.5, 20, DUMMY_MAP, "enad", strips,
+               pdf_strips={12})
