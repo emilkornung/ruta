@@ -11,6 +11,8 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz  # pymupdf
+import numpy as np
+from scipy import ndimage
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -35,8 +37,47 @@ ORANGE_B_MAX               = 60
 # Pink padding color for partial pages (0–1 RGB)
 PINK_PAD_R, PINK_PAD_G, PINK_PAD_B = 0.957, 0.565, 0.710  # ≈ #F490B5
 
-ENABLE_COLOR_LABELS = False    # Master switch — set False to disable color labeling
-                               # globally without needing "inga färger" in every subject
+# ── Color labeling (map-driven, pixel-based) ───────────────────────────────────
+# Rebuilt pipeline. Operates on each already-rendered, already-sliced strip page
+# (post-rotation). All four knobs below are tunable.
+ENABLE_COLOR_LABELS   = False  # Master switch — MUST stay False until color labeling
+                               # is fully validated and explicitly approved (TIF-27).
+                               # Validation harnesses call _label_colors_on_page
+                               # directly and are unaffected by this switch.
+COLOR_MATCH_TOLERANCE = 28     # RGB Euclidean distance for matching a mapped color
+                               # (handles render drift, same idea as pink/orange bands)
+MIN_PATCH_PX          = 10     # discard connected components smaller than this many
+                               # pixels at LABEL_RENDER_SCALE. Strip-15 page 2 gave a
+                               # clean dust/real gap of 8..22 (edge dust <=8px, thin real
+                               # blade segments >=22px). ENAD strip 4 page 1 then showed a
+                               # clearly visible ~19x7cm sliver whose thin ends anti-alias
+                               # away, leaving only 10 in-tolerance px — so the threshold
+                               # sits at 10: still above the 8px dust ceiling, low enough
+                               # to label every patch a painter can actually see.
+LABEL_RENDER_SCALE    = 2.0    # pixmap render scale used for color analysis
+
+# Sizing philosophy (TIF-27 round 3): operators read labels from inches away,
+# so there is no legibility floor — font size is purely a computational tool to
+# make every label fit. Every patch >= MIN_PATCH_PX gets exactly one label at a
+# modest consistent default, shrunk (never grown) until it fits fully inside
+# its own patch without touching any other label.
+LABEL_FONT_DEFAULT    = 3.0    # pt — modest default; labels never exceed this
+LABEL_FONT_SHRINK     = 0.75   # per-step shrink ratio when a size doesn't fit
+LABEL_FONT_TECH_MIN   = 0.1    # pt — technical safety floor only (guards against
+                               # a literal 0/negative size). NOT a legibility
+                               # judgment; hitting it is reported ("forced") and
+                               # means a patch held text in near-zero space.
+
+# Page-number exclusion zone (TIF-27 round 5, restores the legacy ruta.py
+# labeler's dead zone in rect form). The orange page number is inserted AFTER
+# labeling (see slice_one_strip: baseline (width-12, 10), fontsize 6, 1-2
+# digits), so the labeler can't see it in the pixmap — its known footprint is
+# reserved instead by seeding placed_rects. Fitted labels shrink/shift around
+# it like around any other label; forced placements may still enter it (zero
+# skips outranks the dead zone, the operator handles that corner manually).
+PAGE_NUM_EXCL_W  = 13.5  # pt reserved leftward from the right page edge
+PAGE_NUM_EXCL_Y0 = 4.0   # pt from the top edge (glyph top ≈ 5.7 minus pad)
+PAGE_NUM_EXCL_Y1 = 11.5  # pt from the top edge (baseline 10 plus pad)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -116,122 +157,245 @@ def _text_color_for(fill):
     return (0, 0, 0) if lum > 0.45 else (1, 1, 1)
 
 
-def _add_color_labels(page, color_map, strip_h_pts):
+def _hex_to_rgb255(hex_c):
+    """Parse '#RRGGBB' → np.int32 array [r, g, b] in 0–255. None if malformed."""
+    h = hex_c.lstrip("#")
+    if len(h) != 6:
+        return None
+    try:
+        return np.array([int(h[i:i + 2], 16) for i in (0, 2, 4)], dtype=np.int32)
+    except ValueError:
+        return None
+
+
+def _code_masks(arr, color_map):
     """
-    Render the page at low resolution, divide into a 4×2 grid, and place
-    EXACTLY ONE label per mapped color per page.
+    Assign every pixel to its NEAREST mapped color (within tolerance), then
+    union the masks of hexes sharing a paint code.
 
-    The grid is used to find the best position for each color (its dominant
-    winning cell), but only one label is ever placed per color.
+    Nearest-only assignment is the round-4 fix for fragmented double labels:
+    with independent per-hex tolerance bands, two mapped colors closer than
+    2*COLOR_MATCH_TOLERANCE both claimed the same physical fill's pixels, so
+    one shape formed a component in TWO masks and received two different
+    code labels. Per-code unions additionally merge hexes that map to the
+    same code (e.g. #FFFFFF and an off-white both -> "Vit") into a single
+    connected component instead of adjacent duplicate labels.
 
-    Pass 1 — for each color, find the cell where it has the most pixels AND
-             is the dominant color. Place one label at that best cell.
-    Pass 2 — guarantee coverage: any color not labeled in pass 1 (never
-             dominant) gets placed at its best cell, verified by pixel check.
+    "Skip" entries participate in the assignment (they own their pixels, so
+    near-black outline pixels can't leak into a neighbouring code's mask)
+    but are excluded from the returned masks.
 
-    Page number exclusion zone: labels too close to the top-right page number
-    are skipped.
+    Returns {code: bool mask}. Shared with the validation harnesses so the
+    expected-patch recount uses identical semantics.
     """
-    TARGET_PX = 80
-    GRID_COLS = 4
-    GRID_ROWS = 2
-    MIN_CELL  = 0.005   # ≥0.5% of total pixels to be a valid placement
+    reps = []
+    for hex_c, code in color_map.items():
+        if not code:
+            continue
+        rgb = _hex_to_rgb255(hex_c)
+        if rgb is not None:
+            reps.append((code, rgb))
+    if not reps:
+        return {}
 
-    r     = page.rect
-    scale = min(TARGET_PX / r.width, TARGET_PX / r.height)
+    dist = np.stack([((arr - rgb) ** 2).sum(axis=2) for _, rgb in reps])
+    nearest = np.argmin(dist, axis=0)
+    within  = np.min(dist, axis=0) <= COLOR_MATCH_TOLERANCE ** 2
 
-    pix    = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB)
+    masks = {}
+    for k, (code, _) in enumerate(reps):
+        if code == "Skip":
+            continue
+        m = (nearest == k) & within
+        if code in masks:
+            masks[code] |= m
+        else:
+            masks[code] = m
+    return {c: m for c, m in masks.items() if m.any()}
+
+
+def _label_colors_on_page(page, color_map):
+    """
+    Map-driven, pixel-based color labeling for a single rendered strip page.
+
+    For every color in color_map (skipping "Skip"):
+      1. Render the page to a pixmap at LABEL_RENDER_SCALE.
+      2. Build a boolean mask of pixels within COLOR_MATCH_TOLERANCE (RGB
+         Euclidean distance) of the mapped color — a tolerance band that absorbs
+         render drift, same principle as the pink/orange background bands.
+      3. Find separate visible patches with scipy.ndimage.label.
+      4. Discard any patch smaller than MIN_PATCH_PX (filters anti-alias noise).
+      5. Every surviving patch receives EXACTLY ONE label — no skips.
+
+    Placement/sizing per patch (fit-verified, collision-aware, no legibility
+    floor — operators read labels from inches away):
+      - Sizes start at LABEL_FONT_DEFAULT (a modest, consistently small size —
+        labels are never sized up to fill available space) and shrink by
+        LABEL_FONT_SHRINK steps until a placement exists.
+      - A placement means: the label's FULL rendered bbox lies inside the
+        patch's own mask (minimum_filter erosion) AND overlaps no label already
+        placed on the page (any color). The position is the deepest interior
+        point among valid centers. Patches place largest-first so sliver
+        clusters yield to big neighbours.
+      - The shrink ladder bottoms out at LABEL_FONT_TECH_MIN (0.1 pt), where
+        the text is smaller than one analysis pixel and therefore always fits
+        inside the patch. If even that size has no collision-free position,
+        the label is placed anyway at the deepest interior point ("forced" —
+        still inside its own patch, may touch another label) and counted, so
+        a zero-space cluster is visible in the summary rather than silent.
+
+    Returns {code: {"count", "font_sizes", "rects", "placement", "forced"}}
+    for inspection/validation ("rects" are glyph bboxes in page points,
+    aligned with "font_sizes"; "placement" entries are "fit"/"forced").
+    Keyed by paint CODE (not hex) since round 4. The slicing path ignores
+    the return value.
+    """
+    summary = {}
+
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(LABEL_RENDER_SCALE, LABEL_RENDER_SCALE),
+        colorspace=fitz.csRGB,
+    )
     pw, ph = pix.width, pix.height
-    if not pw or not ph:
-        return
+    if not pw or not ph or pix.n < 3:
+        return summary
 
-    samples  = pix.samples
-    total_px = pw * ph
+    # int32 avoids overflow when squaring channel differences (255² > int16 max).
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(ph, pw, pix.n)
+    arr = arr[:, :, :3].astype(np.int32)
 
-    def _sample(xi, yi):
-        xi  = max(0, min(pw - 1, xi))
-        yi  = max(0, min(ph - 1, yi))
-        idx = (yi * pw + xi) * 3
-        return "#{:02X}{:02X}{:02X}".format(samples[idx], samples[idx+1], samples[idx+2])
+    S = LABEL_RENDER_SCALE
 
-    # Build cells: (col, row) → {hex_c: [sx, sy, n, r_f, g_f, b_f, code]}
-    cells = {}
-    for yi in range(ph):
-        for xi in range(pw):
-            idx        = (yi * pw + xi) * 3
-            rv, gv, bv = samples[idx], samples[idx + 1], samples[idx + 2]
-            hex_c      = "#{:02X}{:02X}{:02X}".format(rv, gv, bv)
-            code       = color_map.get(hex_c)
-            if not code or code == "Skip":
+    # ── Pass 1: collect every labelable patch, one mask per paint code ─────
+    # Nearest-color assignment + per-code unions (see _code_masks) so one
+    # physical patch can only ever be one component in one mask.
+    code_text_color = {}
+    for hex_c, code in color_map.items():
+        rgb = _hex_to_rgb255(hex_c)
+        if code and code != "Skip" and rgb is not None and code not in code_text_color:
+            code_text_color[code] = _text_color_for(
+                (rgb[0] / 255, rgb[1] / 255, rgb[2] / 255))
+
+    patches = []
+    for code, mask in _code_masks(arr, color_map).items():
+        lbl, num = ndimage.label(mask)
+        if num == 0:
+            continue
+        counts  = np.bincount(lbl.ravel())
+        objects = ndimage.find_objects(lbl)
+
+        for comp in range(1, num + 1):
+            if counts[comp] < MIN_PATCH_PX:
                 continue
-            col = min(GRID_COLS - 1, int(xi * GRID_COLS / pw))
-            row = min(GRID_ROWS - 1, int(yi * GRID_ROWS / ph))
-            key = (col, row)
-            if key not in cells:
-                cells[key] = {}
-            if hex_c not in cells[key]:
-                cells[key][hex_c] = [0, 0, 0, rv / 255, gv / 255, bv / 255, code]
-            cells[key][hex_c][0] += xi
-            cells[key][hex_c][1] += yi
-            cells[key][hex_c][2] += 1
+            sl       = objects[comp - 1]
+            sub_mask = lbl[sl] == comp
+            # Pad by 1px so the pixmap/page edge counts as a patch boundary:
+            # without it, EDT overestimates the inscribed radius of patches
+            # clipped by the page edge (and of patches exactly filling their
+            # bbox, which have no background pixels in the sub-mask at all).
+            dt = ndimage.distance_transform_edt(np.pad(sub_mask, 1))[1:-1, 1:-1]
+            patches.append((int(counts[comp]), code, sl, sub_mask, dt,
+                            code_text_color[code]))
 
-    min_cell_px = max(1, total_px * MIN_CELL)
-    fs          = max(4, strip_h_pts * 0.04)
+    # Largest patches place first: in dense clusters the slivers yield to
+    # (shrink/shift/skip around) their big neighbours, not the reverse.
+    patches.sort(key=lambda p: -p[0])
 
-    # Page number exclusion zone — small radius around top-right corner
-    pn_x, pn_y = r.width - 12, 10
-    excl_r_sq  = max(fs, 10) ** 2
+    # Seeded with the page number's reserved rect so fitted labels avoid the
+    # spot where slice_one_strip will draw it after labeling.
+    placed_rects = [fitz.Rect(page.rect.width - PAGE_NUM_EXCL_W,
+                              PAGE_NUM_EXCL_Y0,
+                              page.rect.width, PAGE_NUM_EXCL_Y1)]
+    MARGIN       = 0.5  # pt clearance required between labels
 
-    def _ok(cx, cy):
-        return ((cx - pn_x) ** 2 + (cy - pn_y) ** 2) > excl_r_sq
+    for npx, code, sl, sub_mask, dt, text_color in patches:
+        entry = summary.setdefault(
+            code, {"count": 0, "font_sizes": [], "rects": [], "placement": [],
+                   "forced": 0})
 
-    def _place(data, verify_hex=None):
-        sx, sy, n, r_f, g_f, b_f, code = data
-        cx_px = round(sx / n)
-        cy_px = round(sy / n)
-        if verify_hex and _sample(cx_px, cy_px) != verify_hex:
-            return False
-        cx, cy = cx_px / scale, cy_px / scale
-        if not _ok(cx, cy):
-            return False
-        page.insert_text(
-            fitz.Point(cx, cy), code,
-            fontsize = fs,
-            color    = _text_color_for((r_f, g_f, b_f)),
-        )
-        return True
+        r_pts = float(dt.max()) / S
+        wpp   = fitz.get_text_length(code, fontname="helv", fontsize=1.0) or 1.0
+        # Start at the modest default, pre-capped by a cheap geometric estimate
+        # of what the inscribed circle can hold (the fit check verifies anyway;
+        # this just skips pointless filter passes on small patches).
+        fs0 = min(LABEL_FONT_DEFAULT, 2 * r_pts / wpp, 2 * r_pts / 0.72)
+        fs0 = max(fs0, LABEL_FONT_TECH_MIN)
+        sizes = [round(fs0, 3)]
+        while sizes[-1] * LABEL_FONT_SHRINK > LABEL_FONT_TECH_MIN:
+            sizes.append(round(sizes[-1] * LABEL_FONT_SHRINK, 3))
+        if sizes[-1] > LABEL_FONT_TECH_MIN:
+            sizes.append(LABEL_FONT_TECH_MIN)
 
-    # ── Pass 1: one label per color at its best winning cell ─────────────────
-    # For each color find the cell where it wins AND has the most pixels
-    best_wins = {}   # hex_c → best data from a cell where it's dominant
-    for cell_colors in cells.values():
-        winner_hex = max(cell_colors, key=lambda h: cell_colors[h][2])
-        data       = cell_colors[winner_hex]
-        if data[2] < min_cell_px:
-            continue
-        if winner_hex not in best_wins or data[2] > best_wins[winner_hex][2]:
-            best_wins[winner_hex] = data
+        def _fit_map(fs, exclude_collisions):
+            tw = wpp * fs
+            hh = 0.72 * fs   # glyph height: digits/short words, no descenders
+            # Exact ceiling, no extra margin: a +1 pad would force the window
+            # to >=2px at ANY size, slamming 1px-wide slivers straight to the
+            # technical floor even though e.g. 0.3pt text (~0.4px tall) fits.
+            w_px = max(1, int(np.ceil(tw * S)))
+            h_px = max(1, int(np.ceil(hh * S)))
+            if w_px > sub_mask.shape[1] or h_px > sub_mask.shape[0]:
+                return None
+            # Centers where the label's full bbox lies inside the patch mask.
+            # mode="constant" makes anything outside the bbox count as non-fit,
+            # which also keeps fitted labels fully on the page.
+            fit = ndimage.minimum_filter(
+                sub_mask.astype(np.uint8), size=(h_px, w_px),
+                mode="constant", cval=0).astype(bool)
+            if exclude_collisions and fit.any():
+                # Exclude centers whose bbox would overlap an existing label.
+                for R in placed_rects:
+                    ex0 = int(np.floor((R.x0 - tw / 2) * S)) - sl[1].start
+                    ex1 = int(np.ceil((R.x1 + tw / 2) * S)) - sl[1].start
+                    ey0 = int(np.floor((R.y0 - hh / 2) * S)) - sl[0].start
+                    ey1 = int(np.ceil((R.y1 + hh / 2) * S)) - sl[0].start
+                    if ex1 <= 0 or ey1 <= 0 or ex0 >= fit.shape[1] or ey0 >= fit.shape[0]:
+                        continue
+                    fit[max(0, ey0):ey1, max(0, ex0):ex1] = False
+            return fit if fit.any() else None
 
-    labeled = set()
-    for hex_c, data in best_wins.items():
-        if _place(data):
-            labeled.add(hex_c)
+        chosen = None
+        for fs in sizes:
+            fit = _fit_map(fs, exclude_collisions=True)
+            if fit is None:
+                continue
+            # Best-fitting position: deepest interior point among valid centers.
+            yloc, xloc = np.unravel_index(int(np.argmax(np.where(fit, dt, -1.0))),
+                                          fit.shape)
+            chosen = (fs, yloc, xloc, False)
+            break
 
-    # ── Pass 2: guarantee every visible color has exactly one label ───────────
-    # Collect best cell per color across ALL cells (not just winning ones)
-    all_best = {}
-    for cell_colors in cells.values():
-        for hex_c, data in cell_colors.items():
-            if hex_c not in all_best or data[2] > all_best[hex_c][2]:
-                all_best[hex_c] = data
+        if chosen is None:
+            # Even sub-pixel text has no collision-free pixel: every pixel of
+            # this patch is already covered by other labels' rects. Zero skips
+            # is the contract, so place anyway at the deepest interior point —
+            # still inside the patch, may touch another label — and count it.
+            fit = _fit_map(LABEL_FONT_TECH_MIN, exclude_collisions=False)
+            yloc, xloc = np.unravel_index(int(np.argmax(np.where(fit, dt, -1.0))),
+                                          fit.shape)
+            chosen = (LABEL_FONT_TECH_MIN, yloc, xloc, True)
 
-    for hex_c, data in all_best.items():
-        if hex_c in labeled:
-            continue
-        if data[2] < 1:
-            continue
-        if _place(data, verify_hex=hex_c):
-            labeled.add(hex_c)
+        fs, yloc, xloc, forced = chosen
+        tw = wpp * fs
+        hh = 0.72 * fs
+        px = (sl[1].start + xloc + 0.5) / S
+        py = (sl[0].start + yloc + 0.5) / S
+        # Fitted bboxes are inside the page by construction; the clamp only
+        # bites for sub-pixel/forced placements right at a page edge.
+        ox = min(max(px - tw / 2, 0.0), page.rect.width - tw)
+        oy = min(max(py + fs * 0.35, hh), page.rect.height)
+        rect = fitz.Rect(ox - MARGIN, oy - hh - MARGIN, ox + tw + MARGIN, oy + MARGIN)
+
+        page.insert_text(fitz.Point(ox, oy), code, fontsize=fs, color=text_color)
+        placed_rects.append(rect)
+        entry["count"]      += 1
+        entry["font_sizes"].append(round(fs, 2))
+        entry["rects"].append((round(ox, 2), round(oy - hh, 2),
+                               round(ox + tw, 2), round(oy, 2)))
+        entry["placement"].append("forced" if forced else "fit")
+        entry["forced"]     += 1 if forced else 0
+
+    return {h: e for h, e in summary.items() if e["count"]}
 
 
 def extract_pdf_colors(pdf_bytes):
@@ -317,9 +481,10 @@ def slice_one_strip(args):
             new_page.show_pdf_page(dest_rect, src_doc, src_page.number, clip=clip, rotate=rotate)
         # ── END PROTECTED BLOCK ───────────────────────────────────────────────
 
-            # Color labels — per page, after rendering, using pixel centroid detection
+            # Color labels — per page, after rendering, using map-driven pixel
+            # tolerance-band detection + deepest-interior-point placement.
             if color_map:
-                _add_color_labels(new_page, color_map, strip_w_pts)
+                _label_colors_on_page(new_page, color_map)
 
             # Pink padding + dotted cut line on partial pages.
             # pad_x (= content_w) is the content↔pink boundary (= cut line). In
