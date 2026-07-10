@@ -494,7 +494,26 @@ def slice_one_strip(args):
             # the same.
             if is_partial:
                 pink_rect = fitz.Rect(pad_x, 0, page_h_pts, x1 - x0)
-                klipp_pt  = fitz.Point(pad_x + 3, 10)
+                # "Klipp" anchor (TIF-57): originally fixed at (pad_x + 3, 10),
+                # i.e. just right of the cut line inside the pink. On a near-full
+                # partial the pink is a thin sliver at the right edge, so that spot
+                # runs the text off the page AND over the top-right page number —
+                # it looked like the whole marking was missing. Keep the original
+                # right-of-line placement whenever the text fits fully on-page and
+                # clears the page-number footprint (PAGE_NUM_EXCL_W); otherwise
+                # anchor it just LEFT of the cut line instead. Only the anchor
+                # moves — the pink rect, dashed line, font, size and colour below
+                # are unchanged.
+                klipp_w   = fitz.get_text_length("Klipp", fontsize=6)
+                pagenum_x = page_h_pts - PAGE_NUM_EXCL_W - 2.0  # left of page-number zone, w/ gap
+                if pad_x + 3 + klipp_w <= pagenum_x:
+                    klipp_pt = fitz.Point(pad_x + 3, 10)
+                else:
+                    # Pink sliver too thin: anchor just left of the cut line, and
+                    # keep the right edge clear of the page-number zone too (the
+                    # line itself can sit inside that zone on a near-full partial).
+                    right_edge = min(pad_x - 3, pagenum_x)
+                    klipp_pt   = fitz.Point(max(2.0, right_edge - klipp_w), 10)
 
                 shape = new_page.new_shape()
                 shape.draw_rect(pink_rect)
