@@ -20,7 +20,7 @@ STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
 SLICE_WORKERS = 6
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 # Pink page detection
 PINK_THRESHOLD         = 0.85
@@ -168,6 +168,56 @@ def _hex_to_rgb255(hex_c):
         return None
 
 
+def _map_reps(color_map):
+    """
+    Flatten a {hex: code} map into [(code, rgb255), ...] — the representatives
+    every colour decision is made against. One entry per hex, so two hexes
+    sharing a code (or two distinct "Skip" hexes) stay INDEPENDENT claimants
+    during nearest-color assignment.
+
+    Shared by _code_masks() (what gets labeled) and find_unknown_colors() (what
+    gets reported as unmappable) so the two can never drift apart.
+    """
+    reps = []
+    for hex_c, code in color_map.items():
+        if not code:
+            continue
+        rgb = _hex_to_rgb255(hex_c)
+        if rgb is not None:
+            reps.append((code, rgb))
+    return reps
+
+
+def find_unknown_colors(hex_colors, color_map):
+    """
+    Return the design colors that NO colour_map entry can claim — i.e. whose
+    nearest mapped color is further than COLOR_MATCH_TOLERANCE away.
+
+    Uses the same nearest-within-tolerance test as _code_masks(), which is what
+    actually decides whether a pixel gets a label. The pre-TIF-60 gate used
+    exact hex membership (`c not in color_map`) instead, which is the wrong
+    question: rendered vector fills routinely land 1-2 RGB units off the
+    curated hex (e.g. #737272 vs the mapped #737271), so exact matching
+    reported as "unknown" a pile of colors the labeler matches perfectly. On
+    the pest-mitten design that meant 11 reported unknowns where only 1 was
+    real.
+
+    A "Skip" entry counts as claiming its color: the color is known, it is
+    deliberately not labeled. It must never show up as unknown.
+    """
+    reps = _map_reps(color_map)
+    tol_sq = COLOR_MATCH_TOLERANCE ** 2
+
+    unknown = []
+    for hex_c in hex_colors:
+        rgb = _hex_to_rgb255(hex_c)
+        if rgb is None:
+            continue
+        if not reps or min(int(((rgb - r) ** 2).sum()) for _, r in reps) > tol_sq:
+            unknown.append(hex_c)
+    return sorted(unknown)
+
+
 def _code_masks(arr, color_map):
     """
     Assign every pixel to its NEAREST mapped color (within tolerance), then
@@ -188,13 +238,7 @@ def _code_masks(arr, color_map):
     Returns {code: bool mask}. Shared with the validation harnesses so the
     expected-patch recount uses identical semantics.
     """
-    reps = []
-    for hex_c, code in color_map.items():
-        if not code:
-            continue
-        rgb = _hex_to_rgb255(hex_c)
-        if rgb is not None:
-            reps.append((code, rgb))
+    reps = _map_reps(color_map)
     if not reps:
         return {}
 
@@ -680,6 +724,10 @@ def run_slice(
     labeling is disabled (ENABLE_COLOR_LABELS=False) it is ignored, exactly as
     the file-loaded map was.
 
+    Unknown colors (no map entry within COLOR_MATCH_TOLERANCE) are reported in
+    "unknown_colors" and left unlabeled INDIVIDUALLY. They do not suppress
+    labeling of the colors that ARE mapped — see TIF-60.
+
     Returns:
     {
         "strips": [
@@ -699,10 +747,13 @@ def run_slice(
     if not effective_skip:
         color_map  = colour_map or {}
         hex_colors = extract_pdf_colors(pdf_bytes)
-        unknown_colors = sorted(c for c in hex_colors if c not in color_map)
-        if unknown_colors:
-            # Unknown colors found — slice without labels so strips are still returned
-            color_map = {}
+        # TIF-60: unknown colors are REPORTED, never a reason to discard the map.
+        # The old code set color_map = {} whenever any unknown was found, so a
+        # single unmapped accent shipped the whole design with zero labels —
+        # silently, since nothing logged or persisted unknown_colors. Unmapped
+        # colors are simply left unlabeled by _code_masks (they fall outside
+        # every tolerance band); every mapped color still gets its label.
+        unknown_colors = find_unknown_colors(hex_colors, color_map)
     else:
         color_map = {}
 
