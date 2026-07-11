@@ -66,6 +66,10 @@ MIN_PATCH_PX          = 10     # discard connected components smaller than this 
                                # to label every patch a painter can actually see.
 LABEL_RENDER_SCALE    = 2.0    # pixmap render scale used for color analysis
 
+CUT_EDGE_EPS = 1.0   # pt — content closer than this to a page's outer edge counts
+                     # as running off the edge: there is no leftover to cut, so no
+                     # Klipp line. Mirrors is_partial's own `page_h_pts - 1` slack.
+
 # Sizing philosophy (TIF-27 round 3): operators read labels from inches away,
 # so there is no legibility floor — font size is purely a computational tool to
 # make every label fit. Every patch >= MIN_PATCH_PX gets exactly one label at a
@@ -266,6 +270,183 @@ def _code_masks(arr, color_map):
         else:
             masks[code] = m
     return {c: m for c, m in masks.items() if m.any()}
+
+
+def _background_mask(arr, color_map):
+    """
+    True where a pixel is design BACKGROUND — i.e. NOT real content.
+
+    Two signals, unioned, because they fail in different places:
+
+      1. colour_map "Skip" entries — a pixel whose NEAREST map rep (within
+         COLOR_MATCH_TOLERANCE) carries the code "Skip". This is the precise,
+         general answer: it follows whatever hex a design declares as its
+         not-to-be-cut background, not just pest-mitten's pink #EEA8CB. It
+         reuses _map_reps(), the very reps the labeler matches with, so the
+         classifier and the labeler cannot drift apart (the TIF-60 lesson).
+
+      2. The legacy pink/orange RGB ranges (is_fully_background's classifier), a
+         best-effort net for when colour_map is empty — run_slice() passes {}
+         whenever skip_colors=True or ENABLE_COLOR_LABELS=False.
+
+    Signal 2 alone is NOT sufficient to find a content boundary, and is not
+    relied on to. Its range is a hard box, and rendered background anti-aliases
+    out of it: pest-mitten's bottom edge row comes out #F2BFD8, whose green 191
+    is one unit past PINK_G_MAX=190, so the row reads as content and drags the
+    boundary to the design's edge. Signal 1 gets it right (#F2BFD8 is 26.7 from
+    the mapped #EEA8CB, inside COLOR_MATCH_TOLERANCE=28) because nearest-rep
+    matching absorbs exactly that drift.
+
+    So with no colour_map the scan degrades to finding the boundary at the clip
+    edge — which is precisely cut_x == the old pad_x, i.e. the pre-existing
+    geometric behaviour, no better and no worse. That degradation is safe by
+    construction and is what _validate_klipp_partial.py (which passes {}) pins
+    down. Widening the pink box to cover the anti-aliased fringe is NOT done
+    here: PINK_G_MAX is is_fully_background's, and a second, divergent
+    definition of "pink" is the drift TIF-60 warned about.
+
+    Everything else is content, deliberately including:
+      - unknown colours (no rep within tolerance) — real artwork that still
+        prints, merely unlabeled (TIF-60);
+      - white — #FFFFFF is the real paint code "V" (Vit), not blank paper.
+    """
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+    is_pink = ((r > PINK_R_MIN)
+               & (g > PINK_G_MIN) & (g < PINK_G_MAX)
+               & (b > PINK_B_MIN) & (b < PINK_B_MAX)
+               & (r > g) & (r > b))
+    is_orange = ((r > ORANGE_R_MIN)
+                 & (g > ORANGE_G_MIN) & (g < ORANGE_G_MAX)
+                 & (b < ORANGE_B_MAX) & (r > g) & (g > b))
+    bg = is_pink | is_orange
+
+    reps = _map_reps(color_map)
+    skip_ks = [k for k, (code, _) in enumerate(reps) if code == "Skip"]
+    if skip_ks:
+        dist    = np.stack([((arr - rgb) ** 2).sum(axis=2) for _, rgb in reps])
+        nearest = np.argmin(dist, axis=0)
+        within  = np.min(dist, axis=0) <= COLOR_MATCH_TOLERANCE ** 2
+        for k in skip_ks:
+            bg |= (nearest == k) & within
+    return bg
+
+
+def _find_cut_boundary(src_doc, src_page_num, x0, x1, full_h, page_h_pts,
+                       num_pages, ruta_nedre, color_map):
+    """
+    Find the ONE point across a whole strip where real design content stops for
+    good — where "Klipp" belongs. Returns (page_num, cut_x) with cut_x in OUTPUT
+    page coordinates, or None when there is nothing to cut.
+
+    Why this replaces is_partial as the trigger: is_partial is a purely GEOMETRIC
+    test (does the source clip cover the full output page?). It is blind to a
+    design whose artwork ends mid-page inside its own painted background.
+    pest-mitten is 24 m tall with 4 m pages, so it divides into six FULL pages
+    and no page is ever partial — yet its artwork stops partway into page 6 and
+    the rest is painted pink. No cut line was drawn anywhere on that design.
+
+    The strip's column is scanned ONCE, at LABEL_RENDER_SCALE — deliberately NOT
+    the 21-pixel sampler is_fully_background() uses, which is far too coarse to
+    locate a boundary row (see TIF-65). The last content pixel in PRINTING
+    SEQUENCE order wins.
+
+    One coordinate unifies both rotation modes, so nothing below branches on
+    ruta_nedre except the definition itself:
+
+        seq(design_y) = full_h - design_y   (default,    rotate=270, bottom→top)
+        seq(design_y) = design_y            (ruta_nedre, rotate=90,  top→bottom)
+
+    seq is "distance travelled along the printing sequence", and for any point
+    in the strip it gives both the page and the position on it:
+
+        page_num = floor(seq / page_h_pts)
+        output_x = seq mod page_h_pts
+
+    which is exactly where the old code drew the line — at output_x = content_w,
+    the seq-position where the source CLIP runs out. This function swaps that for
+    the seq-position where the CONTENT runs out. The geometric case then falls
+    out as a special case: content reaching the clip edge yields cut_x =
+    content_w, i.e. the old behaviour, byte for byte.
+    """
+    S    = LABEL_RENDER_SCALE
+    pix  = src_doc[src_page_num].get_pixmap(
+        matrix=fitz.Matrix(S, S), clip=fitz.Rect(x0, 0.0, x1, full_h),
+        colorspace=fitz.csRGB)
+    if pix.width == 0 or pix.height == 0:
+        return None
+
+    arr = np.frombuffer(pix.samples, dtype=np.uint8) \
+            .reshape(pix.height, pix.width, pix.n)[:, :, :3].astype(np.int32)
+
+    content = ~_background_mask(arr, color_map)
+
+    # Discard the 1-pixel BORDER of the render. Those pixels have PARTIAL coverage
+    # — the rasterizer blends the clip's edge with whatever lies outside it — so
+    # they are an artifact, not artwork, and they are full-width/full-height, which
+    # means they sail straight past the MIN_PATCH_PX dust filter below.
+    #
+    # Both axes bite, and both were caught on pest-mitten:
+    #   rows — the design's bottom row renders #F2BFD8 at LABEL_RENDER_SCALE (26.7
+    #     from the mapped #EEA8CB, i.e. inside COLOR_MATCH_TOLERANCE by a mere 1.3)
+    #     and #F7D6E6 at scale 4.0 (54.1, well outside), while the row behind it is
+    #     a clean #EEA8CA at 1.0. Read as content, it pins the boundary to the
+    #     design's edge and suppresses the cut line — silently.
+    #   cols — the first and last strip sit on the design's left/right edge, so
+    #     their outer pixel column washes out the same way, full height, and reads
+    #     as a content column running past the true boundary.
+    # Untrimmed, this detector works only by luck at one particular render scale.
+    #
+    # Trimming all four sides covers both slicing modes (the sequence's far end is
+    # row 0 under rotate=270, the last row under rotate=90). Where real content
+    # does reach an edge, this pulls the boundary in by just 1/S pt — which
+    # CUT_EDGE_EPS absorbs — so it can never invent a cut line where there is
+    # nothing to cut.
+    if content.shape[0] >= 3 and content.shape[1] >= 3:
+        content[0, :]  = content[-1, :] = False
+        content[:, 0]  = content[:, -1] = False
+
+    # Dust filter — the same connected-component + MIN_PATCH_PX semantics the
+    # labeler uses, so anti-alias speckle inside a background region cannot read
+    # as "content" and drag the boundary to the far end of the strip.
+    lbl, n = ndimage.label(content)
+    if n == 0:
+        return None
+    counts  = np.bincount(lbl.ravel())
+    keep    = counts >= MIN_PATCH_PX
+    keep[0] = False                      # component 0 is the background itself
+    content = keep[lbl]
+
+    rows = np.flatnonzero(content.any(axis=1))
+    if rows.size == 0:
+        return None
+
+    # The last content pixel in sequence order: seq rises with design_y under
+    # ruta_nedre and falls with it under the default, so the winning row is the
+    # last or the first respectively. The boundary is that pixel's FAR edge (the
+    # side the leftover fabric lies on); its MIDPOINT decides which page owns it,
+    # which keeps content that ends exactly on a page seam attributed to the page
+    # it actually sits on rather than to the empty page after it.
+    if ruta_nedre:
+        r_last       = int(rows[-1])
+        boundary_seq = (r_last + 1) / S
+        seq_mid      = (r_last + 0.5) / S
+    else:
+        r_last       = int(rows[0])
+        boundary_seq = full_h - r_last / S
+        seq_mid      = full_h - (r_last + 0.5) / S
+
+    pn    = min(max(int(seq_mid // page_h_pts), 0), num_pages - 1)
+    cut_x = boundary_seq - pn * page_h_pts
+
+    # Content runs out to the page's outer edge, so there is no leftover fabric
+    # to cut. This also absorbs content ending exactly on a page seam, where
+    # cut_x lands at page_h_pts on the page the content is on: suppress rather
+    # than draw a degenerate line flush with the page edge.
+    if cut_x >= page_h_pts - CUT_EDGE_EPS:
+        return None
+
+    return pn, cut_x
 
 
 def _label_colors_on_page(page, color_map):
@@ -474,8 +655,20 @@ def slice_one_strip(args):
     Fully pink pages are skipped but page numbers are preserved.
     Color labels are added PER STRIP PAGE after rendering (never cross slice boundaries).
     Returns (strip_number, pdf_bytes).
+
+    color_map and skip_labels are INDEPENDENT (TIF-57 follow-up). The map has two
+    consumers and they are not the same concern:
+      - pass A (_find_cut_boundary) needs it to recognise the design's "Skip"
+        background, i.e. to know where the artwork stops and the Klipp line goes;
+      - pass B (_label_colors_on_page) needs it to draw the visible NCS codes.
+    skip_labels suppresses ONLY the latter. Callers that want no printed labels
+    must therefore pass skip_labels=True and still hand over the real map, rather
+    than wiping it to {} — a wiped map silently downgrades cut detection to the
+    legacy pink/orange fallback, which cannot see a design whose background is
+    some other declared Skip colour.
     """
-    s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map, ruta_nedre = args
+    (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map,
+     ruta_nedre, skip_labels) = args
 
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc = fitz.open()
@@ -492,6 +685,17 @@ def slice_one_strip(args):
 
         x0 = s * strip_w_pts
         x1 = min((s + 1) * strip_w_pts, full_w)
+
+        # ── Pass A: where does this strip's content stop for good? ────────────
+        # Scanned across the WHOLE strip before anything is drawn, because "the
+        # single last-content boundary" is a property of the strip, not of any
+        # one page — deciding it per page independently is what let the old
+        # is_partial trigger miss it entirely. Yields the one page that gets the
+        # cut marking (and where on it), or None when there is nothing to cut.
+        cut = _find_cut_boundary(src_doc, src_page.number, x0, x1, full_h,
+                                 page_h_pts, num_pages, ruta_nedre, color_map)
+        cut_page, cut_x = cut if cut else (None, None)
+        rendered_pages  = set()
 
         # ── PROTECTED ROTATION BLOCK — DO NOT CHANGE WITHOUT EXPLICIT CONSENT ─
         # Default (ruta_nedre=False): bottom-to-top — page 1 = bottom of design,
@@ -535,20 +739,36 @@ def slice_one_strip(args):
             new_page.show_pdf_page(dest_rect, src_doc, src_page.number, clip=clip, rotate=rotate)
         # ── END PROTECTED BLOCK ───────────────────────────────────────────────
 
+            rendered_pages.add(page_num)
+
             # Color labels — per page, after rendering, using map-driven pixel
             # tolerance-band detection + deepest-interior-point placement.
-            if color_map:
+            # Gated on skip_labels, NOT on the map being empty: pass A above still
+            # needs the real map even when no labels are to be printed.
+            if color_map and not skip_labels:
                 _label_colors_on_page(new_page, color_map)
 
-            # Pink padding + dotted cut line on partial pages.
-            # pad_x (= content_w) is the content↔pink boundary (= cut line). In
-            # BOTH modes the content is left-aligned and the pink dead-space fills
-            # the right — the design's free outer edge. rotate makes that edge the
-            # design TOP (default) or BOTTOM (ruta_nedre); the placement code is
-            # the same.
+            # Pink padding on a GEOMETRICALLY partial page — the source clip did
+            # not cover the full output page, so pad_x (= content_w) onwards is
+            # dead space. Purely geometric, unchanged: this fills the void, it is
+            # NOT the cut marking (a full page can need a cut and no pad; a padded
+            # page can need no cut). In BOTH modes the content is left-aligned and
+            # the pad fills the right — the design's free outer edge. rotate makes
+            # that edge the design TOP (default) or BOTTOM (ruta_nedre).
             if is_partial:
-                pink_rect = fitz.Rect(pad_x, 0, page_h_pts, x1 - x0)
-                # "Klipp" anchor (TIF-57): originally fixed at (pad_x + 3, 10),
+                shape = new_page.new_shape()
+                shape.draw_rect(fitz.Rect(pad_x, 0, page_h_pts, x1 - x0))
+                shape.finish(fill=(PINK_PAD_R, PINK_PAD_G, PINK_PAD_B), fill_opacity=1.0, color=None)
+                shape.commit()
+
+            # Dashed cut line + "Klipp" — drawn on the ONE page per strip that
+            # holds the content boundary found by pass A, at cut_x. Formerly this
+            # was gated on is_partial and drawn at pad_x, which only ever fired on
+            # a geometric leftover; it could not see a design that ends mid-page
+            # inside its own painted background. Where the old trigger did fire,
+            # cut_x == pad_x and the output is unchanged.
+            if cut_page is not None and page_num == cut_page:
+                # "Klipp" anchor (TIF-57): originally fixed at (cut_x + 3, 10),
                 # i.e. just right of the cut line inside the pink. On a near-full
                 # partial the pink is a thin sliver at the right edge, so that spot
                 # runs the text off the page AND over the top-right page number —
@@ -556,26 +776,20 @@ def slice_one_strip(args):
                 # right-of-line placement whenever the text fits fully on-page and
                 # clears the page-number footprint (PAGE_NUM_EXCL_W); otherwise
                 # anchor it just LEFT of the cut line instead. Only the anchor
-                # moves — the pink rect, dashed line, font, size and colour below
-                # are unchanged.
+                # moves — the dashed line, font, size and colour below are unchanged.
                 klipp_w   = fitz.get_text_length("Klipp", fontsize=6)
                 pagenum_x = page_h_pts - PAGE_NUM_EXCL_W - 2.0  # left of page-number zone, w/ gap
-                if pad_x + 3 + klipp_w <= pagenum_x:
-                    klipp_pt = fitz.Point(pad_x + 3, 10)
+                if cut_x + 3 + klipp_w <= pagenum_x:
+                    klipp_pt = fitz.Point(cut_x + 3, 10)
                 else:
                     # Pink sliver too thin: anchor just left of the cut line, and
                     # keep the right edge clear of the page-number zone too (the
                     # line itself can sit inside that zone on a near-full partial).
-                    right_edge = min(pad_x - 3, pagenum_x)
+                    right_edge = min(cut_x - 3, pagenum_x)
                     klipp_pt   = fitz.Point(max(2.0, right_edge - klipp_w), 10)
 
                 shape = new_page.new_shape()
-                shape.draw_rect(pink_rect)
-                shape.finish(fill=(PINK_PAD_R, PINK_PAD_G, PINK_PAD_B), fill_opacity=1.0, color=None)
-                shape.commit()
-
-                shape = new_page.new_shape()
-                shape.draw_line(fitz.Point(pad_x, 0), fitz.Point(pad_x, x1 - x0))
+                shape.draw_line(fitz.Point(cut_x, 0), fitz.Point(cut_x, x1 - x0))
                 shape.finish(color=(0.15, 0.15, 0.15), width=1.0, dashes="[4 4] 0")
                 shape.commit()
 
@@ -594,6 +808,17 @@ def slice_one_strip(args):
                 color    = (1, 0.5, 0),
             )
 
+        # The content scan says the strip's content ends on a page that
+        # is_fully_background() then excluded from rendering. Those two should
+        # never disagree — a page holding content is not ~85%+ background — but
+        # that sampler reads only ~21 pixels per page (TIF-65), so near its
+        # threshold it can be wrong. Drawing a cut line derived from a page nobody
+        # prints would be worse than drawing none: suppress, and say so.
+        if cut_page is not None and cut_page not in rendered_pages:
+            print(f"    WARNING: strip {s + 1} — content boundary falls on page "
+                  f"{cut_page + 1}, which is_fully_background() excluded from "
+                  f"rendering. No Klipp marking drawn for this strip.")
+
     buf = io.BytesIO()
     out_doc.save(buf)
     out_doc.close()
@@ -601,13 +826,15 @@ def slice_one_strip(args):
     return (s + 1, buf.getvalue())
 
 
-def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False):
+def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False,
+               skip_labels=False):
     """Slice pdf_bytes into vertical strips in parallel. Returns sorted list of (strip_num, bytes)."""
     num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
     num_pages  = math.ceil(height_m / PAGE_HEIGHT_M)
 
     args = [
-        (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {}, ruta_nedre)
+        (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {},
+         ruta_nedre, skip_labels)
         for s in range(num_strips)
     ]
 
@@ -730,9 +957,14 @@ def run_slice(
     Slices a PDF into 1.5m-wide vertical strips.
 
     colour_map is a {hex: ncs_code} dict sourced from Supabase and passed in by
-    the caller (api.py). It replaces the retired local color_map.json. When
-    labeling is disabled (ENABLE_COLOR_LABELS=False) it is ignored, exactly as
-    the file-loaded map was.
+    the caller (api.py). It replaces the retired local color_map.json.
+
+    skip_colors (and ENABLE_COLOR_LABELS=False) suppress the printed NCS code
+    labels ONLY. The map is still handed to the slicer, because it has a second,
+    unrelated consumer: the cut-boundary scan reads its "Skip" entries to find
+    where the artwork stops and the Klipp line belongs. Wiping the map for
+    skip_colors runs — as this used to — left them on geometric-only cut
+    detection, blind to a design that ends mid-page inside painted background.
 
     Unknown colors (no map entry within COLOR_MATCH_TOLERANCE) are reported in
     "unknown_colors" and left unlabeled INDIVIDUALLY. They do not suppress
@@ -754,8 +986,16 @@ def run_slice(
     effective_skip = skip_colors or (not ENABLE_COLOR_LABELS)
     unknown_colors = []
 
+    # The map is ALWAYS handed to the slicer, even when labels are suppressed.
+    # effective_skip means "print no NCS codes", not "forget what the colours
+    # mean": the cut-boundary scan (pass A) still needs the map to recognise the
+    # design's "Skip" background and place Klipp where the artwork actually ends.
+    # This used to be `color_map = {}`, which silently downgraded every
+    # skip_colors run to the legacy pink/orange fallback — geometric-only cut
+    # detection, blind to any design whose background is a different Skip colour.
+    color_map = colour_map or {}
+
     if not effective_skip:
-        color_map  = colour_map or {}
         hex_colors = extract_pdf_colors(pdf_bytes)
         # TIF-60: unknown colors are REPORTED, never a reason to discard the map.
         # The old code set color_map = {} whenever any unknown was found, so a
@@ -764,10 +1004,9 @@ def run_slice(
         # colors are simply left unlabeled by _code_masks (they fall outside
         # every tolerance band); every mapped color still gets its label.
         unknown_colors = find_unknown_colors(hex_colors, color_map)
-    else:
-        color_map = {}
 
-    strips_raw = _slice_pdf(pdf_bytes, width_m, height_m, color_map, ruta_nedre=ruta_nedre)
+    strips_raw = _slice_pdf(pdf_bytes, width_m, height_m, color_map,
+                            ruta_nedre=ruta_nedre, skip_labels=effective_skip)
 
     strips = [
         {"filename": f"strip-{strip_num:02d}.pdf", "bytes": strip_bytes}
