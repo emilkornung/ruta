@@ -10,7 +10,7 @@ Accepts a PDF upload together with the physical dimensions (width × height in m
 - Bottom-to-top page ordering within each strip
 - Pink partial-page padding with a dotted cut line and "Klipp" label
 - Banderoll mode: rotates a landscape source PDF 90° before slicing
-- Optional per-page colour code labels (disabled by default via `ENABLE_COLOR_LABELS`)
+- Per-page colour code labels, enabled in production via `ENABLE_COLOR_LABELS`
 - Parallel strip generation
 
 ## Run locally
