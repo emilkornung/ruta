@@ -18,6 +18,7 @@ The zero-skip contract is asserted: placed must equal the independently
 recounted number of patches >= MIN_PATCH_PX.
 """
 import math
+import os
 import time
 
 import fitz
@@ -31,7 +32,7 @@ OUT_DIR   = "validation"
 
 
 def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
-               pdf_strips=()):
+               pdf_strips=(), ruta_nedre=False, out_dir=OUT_DIR):
     num_strips = math.ceil(width_m / slicer.STRIP_WIDTH_M)
     num_pages  = math.ceil(height_m / slicer.PAGE_HEIGHT_M)
     strips     = strips if strips is not None else list(range(num_strips))
@@ -82,24 +83,25 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
         for s in strips:
             strip_num, strip_bytes = slicer.slice_one_strip(
                 (s, pdf_bytes, width_m, height_m, num_strips, num_pages,
-                 dummy_map, False))
+                 dummy_map, ruta_nedre))
+            os.makedirs(out_dir, exist_ok=True)
             if strip_num in pdf_strips:
                 # Actual labeled vector output (what production would upload),
                 # for reviewing text at real print scale instead of raster.
-                with open(f"{OUT_DIR}/{prefix}_strip{strip_num}.pdf", "wb") as fh:
+                with open(f"{out_dir}/{prefix}_strip{strip_num}.pdf", "wb") as fh:
                     fh.write(strip_bytes)
             out = fitz.open(stream=strip_bytes, filetype="pdf")
             for pi, pg in enumerate(out):
                 pg.get_pixmap(matrix=fitz.Matrix(PNG_SCALE, PNG_SCALE),
                               colorspace=fitz.csRGB) \
-                  .save(f"{OUT_DIR}/{prefix}_strip{strip_num}_p{pi + 1}.png")
+                  .save(f"{out_dir}/{prefix}_strip{strip_num}_p{pi + 1}.png")
             n_pages += len(out)
             out.close()
             print(f"  strip {strip_num}/{num_strips} done ({time.time() - t0:.0f}s)")
     finally:
         slicer._label_colors_on_page = real_label
 
-    print(f"\n{n_pages} pages rendered to {OUT_DIR}/ in {time.time() - t0:.0f}s")
+    print(f"\n{n_pages} pages rendered to {out_dir}/ in {time.time() - t0:.0f}s")
     print("\nPer code:  placed (fitted / forced)")
     tp = tf = tfo = 0
     for code in sorted(totals):
