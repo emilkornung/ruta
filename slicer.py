@@ -655,8 +655,20 @@ def slice_one_strip(args):
     Fully pink pages are skipped but page numbers are preserved.
     Color labels are added PER STRIP PAGE after rendering (never cross slice boundaries).
     Returns (strip_number, pdf_bytes).
+
+    color_map and skip_labels are INDEPENDENT (TIF-57 follow-up). The map has two
+    consumers and they are not the same concern:
+      - pass A (_find_cut_boundary) needs it to recognise the design's "Skip"
+        background, i.e. to know where the artwork stops and the Klipp line goes;
+      - pass B (_label_colors_on_page) needs it to draw the visible NCS codes.
+    skip_labels suppresses ONLY the latter. Callers that want no printed labels
+    must therefore pass skip_labels=True and still hand over the real map, rather
+    than wiping it to {} — a wiped map silently downgrades cut detection to the
+    legacy pink/orange fallback, which cannot see a design whose background is
+    some other declared Skip colour.
     """
-    s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map, ruta_nedre = args
+    (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map,
+     ruta_nedre, skip_labels) = args
 
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc = fitz.open()
@@ -731,7 +743,9 @@ def slice_one_strip(args):
 
             # Color labels — per page, after rendering, using map-driven pixel
             # tolerance-band detection + deepest-interior-point placement.
-            if color_map:
+            # Gated on skip_labels, NOT on the map being empty: pass A above still
+            # needs the real map even when no labels are to be printed.
+            if color_map and not skip_labels:
                 _label_colors_on_page(new_page, color_map)
 
             # Pink padding on a GEOMETRICALLY partial page — the source clip did
@@ -812,13 +826,15 @@ def slice_one_strip(args):
     return (s + 1, buf.getvalue())
 
 
-def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False):
+def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False,
+               skip_labels=False):
     """Slice pdf_bytes into vertical strips in parallel. Returns sorted list of (strip_num, bytes)."""
     num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
     num_pages  = math.ceil(height_m / PAGE_HEIGHT_M)
 
     args = [
-        (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {}, ruta_nedre)
+        (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {},
+         ruta_nedre, skip_labels)
         for s in range(num_strips)
     ]
 
@@ -941,9 +957,14 @@ def run_slice(
     Slices a PDF into 1.5m-wide vertical strips.
 
     colour_map is a {hex: ncs_code} dict sourced from Supabase and passed in by
-    the caller (api.py). It replaces the retired local color_map.json. When
-    labeling is disabled (ENABLE_COLOR_LABELS=False) it is ignored, exactly as
-    the file-loaded map was.
+    the caller (api.py). It replaces the retired local color_map.json.
+
+    skip_colors (and ENABLE_COLOR_LABELS=False) suppress the printed NCS code
+    labels ONLY. The map is still handed to the slicer, because it has a second,
+    unrelated consumer: the cut-boundary scan reads its "Skip" entries to find
+    where the artwork stops and the Klipp line belongs. Wiping the map for
+    skip_colors runs — as this used to — left them on geometric-only cut
+    detection, blind to a design that ends mid-page inside painted background.
 
     Unknown colors (no map entry within COLOR_MATCH_TOLERANCE) are reported in
     "unknown_colors" and left unlabeled INDIVIDUALLY. They do not suppress
@@ -965,8 +986,16 @@ def run_slice(
     effective_skip = skip_colors or (not ENABLE_COLOR_LABELS)
     unknown_colors = []
 
+    # The map is ALWAYS handed to the slicer, even when labels are suppressed.
+    # effective_skip means "print no NCS codes", not "forget what the colours
+    # mean": the cut-boundary scan (pass A) still needs the map to recognise the
+    # design's "Skip" background and place Klipp where the artwork actually ends.
+    # This used to be `color_map = {}`, which silently downgraded every
+    # skip_colors run to the legacy pink/orange fallback — geometric-only cut
+    # detection, blind to any design whose background is a different Skip colour.
+    color_map = colour_map or {}
+
     if not effective_skip:
-        color_map  = colour_map or {}
         hex_colors = extract_pdf_colors(pdf_bytes)
         # TIF-60: unknown colors are REPORTED, never a reason to discard the map.
         # The old code set color_map = {} whenever any unknown was found, so a
@@ -975,10 +1004,9 @@ def run_slice(
         # colors are simply left unlabeled by _code_masks (they fall outside
         # every tolerance band); every mapped color still gets its label.
         unknown_colors = find_unknown_colors(hex_colors, color_map)
-    else:
-        color_map = {}
 
-    strips_raw = _slice_pdf(pdf_bytes, width_m, height_m, color_map, ruta_nedre=ruta_nedre)
+    strips_raw = _slice_pdf(pdf_bytes, width_m, height_m, color_map,
+                            ruta_nedre=ruta_nedre, skip_labels=effective_skip)
 
     strips = [
         {"filename": f"strip-{strip_num:02d}.pdf", "bytes": strip_bytes}

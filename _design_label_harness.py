@@ -83,7 +83,7 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
         for s in strips:
             strip_num, strip_bytes = slicer.slice_one_strip(
                 (s, pdf_bytes, width_m, height_m, num_strips, num_pages,
-                 dummy_map, ruta_nedre))
+                 dummy_map, ruta_nedre, False))   # skip_labels=False — labels are the point
             os.makedirs(out_dir, exist_ok=True)
             if strip_num in pdf_strips:
                 # Actual labeled vector output (what production would upload),
