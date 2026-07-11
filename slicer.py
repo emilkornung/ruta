@@ -46,6 +46,16 @@ ENABLE_COLOR_LABELS   = True   # Master switch — color labeling is live in pro
                                # by this switch.
 COLOR_MATCH_TOLERANCE = 28     # RGB Euclidean distance for matching a mapped color
                                # (handles render drift, same idea as pink/orange bands)
+                               # TIF-55: tightly calibrated, not an arbitrary default.
+                               # Real production art needs matches up to ~26 RGB units
+                               # of legitimate same-color shading/gradient variance
+                               # (pest-mitten design, #231F20->8010 at 26.0) -- 28 clears
+                               # that with only ~2.0 units of margin. Do not lower without
+                               # re-verifying against real shipped designs; there is no
+                               # headroom to spare. Watch condition: the tightest known-
+                               # color pair today is 8010/8500 at 23.94 apart -- if a new
+                               # manual colour_map entry ever lands near that neighborhood,
+                               # re-verify this value.
 MIN_PATCH_PX          = 10     # discard connected components smaller than this many
                                # pixels at LABEL_RENDER_SCALE. Strip-15 page 2 gave a
                                # clean dust/real gap of 8..22 (edge dust <=8px, thin real
