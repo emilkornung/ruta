@@ -38,10 +38,11 @@ async def slice_pdf(
 
     # Colour map arrives as a JSON array of {hex, ncs_code, tolerance} sourced
     # from Supabase (the web app's getColourMapForRuta). Collapse it into the
-    # {hex: ncs_code} dict the active _add_color_labels() path consumes. Hex is
-    # upper-cased to match the keys that labeling builds from rendered pixels.
-    # tolerance is not consumed by the current exact-match labeling path; it is
-    # reserved for the TIF-27 tolerance-band labeling once that is enabled.
+    # {hex: ncs_code} dict the labeling path consumes. Hex is upper-cased to
+    # match the keys that labeling builds from rendered pixels.
+    # Per-entry `tolerance` is not consumed: labeling matches against the single
+    # global slicer.COLOR_MATCH_TOLERANCE band. Per-entry tolerance remains
+    # unimplemented.
     colour_map_list = json.loads(colour_map) if colour_map else []
     colour_map_dict = {
         entry["hex"].upper(): entry["ncs_code"]
@@ -67,6 +68,20 @@ async def slice_pdf(
         ruta_nedre=ruta_nedre_bool,
         colour_map=colour_map_dict
     )
+
+    # TIF-60: unknown colors used to silently wipe the whole colour_map and ship
+    # unlabeled strips, with nothing in the logs to show for it. They no longer
+    # suppress labeling, but they DO mean some patches went unlabeled — so say so
+    # loudly. The caller also persists this list onto the job record.
+    unknown = result["unknown_colors"]
+    if unknown:
+        logger.warning(
+            f"{len(unknown)} unknown color(s) — no colour_map entry within "
+            f"tolerance; these are left UNLABELED (all mapped colors still "
+            f"labeled): {', '.join(unknown)}"
+        )
+    else:
+        logger.info("All design colors matched a colour_map entry.")
 
     return {
         "strips": [
