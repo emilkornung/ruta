@@ -141,11 +141,15 @@ def expected_boundary(src_doc, strip_idx):
     boundary_seq = (r_last + 1) / S
     seq_mid      = (r_last + 0.5) / S
     num_pages    = math.ceil(HEIGHT_M / slicer.PAGE_HEIGHT_M)
-    pn    = min(max(int(seq_mid // page_h), 0), num_pages - 1)
-    cut_x = boundary_seq - pn * page_h
-    if cut_x >= page_h - slicer.CUT_EDGE_EPS:
+    pn     = min(max(int(seq_mid // page_h), 0), num_pages - 1)
+    b_star = boundary_seq - pn * page_h
+    # TIF-67 (rev): one upfront gate — total pink <= KLIPP_MIN_PINK_PT suppresses the
+    # whole marking — then the line sits KLIPP_LINE_MARGIN_PT into the pink. Mirror
+    # both here so this independent recomputation predicts the SAME line the code
+    # draws (still an independent render/classifier — only the geometry matches).
+    if page_h - b_star <= slicer.KLIPP_MIN_PINK_PT:
         return None
-    return pn, cut_x
+    return pn, b_star + slicer.KLIPP_LINE_MARGIN_PT
 
 
 def run():
@@ -234,6 +238,12 @@ def run():
         kb = klipp["bbox"]
         if kb[0] < -0.5 or kb[2] > w + 0.5:
             bad.append(f'"Klipp" off-page: x[{kb[0]:.1f}..{kb[2]:.1f}] width {w:.1f}')
+        # (6) TIF-67 HARD RULE: the text ALWAYS sits to the RIGHT of the line, never
+        # left. Any left-of-line placement is a bug (this is the invariant TIF-67
+        # tightened over TIF-57's now-removed left-side fallback).
+        if lines and kb[0] < lines[0]["rect"].x0 - 0.5:
+            bad.append(f'"Klipp" is LEFT of the cut line (x0={kb[0]:.1f} < line '
+                       f'{lines[0]["rect"].x0:.1f}) — TIF-67 forbids this')
         pnum = next((s for s in _spans(pg) if s["text"].strip().isdigit()), None)
         if pnum:
             pb = pnum["bbox"]

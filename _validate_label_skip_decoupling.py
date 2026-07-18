@@ -41,7 +41,9 @@ PEST_PAGE  = 5       # 0-based: page 6
 # guard uses: a height that does NOT divide evenly, forcing a partial last page.
 KENTA       = "kenta.pdf"
 KENTA_W     = 21.0
-KENTA_H     = 3.9
+KENTA_H     = 3.0        # wide leftover (~1 m of pink) so the TIF-67 margin fits with
+                        # room to spare — this guard is about cut DETECTION, not the
+                        # near-full sliver edge cases (those live in the TIF-67 guard)
 KENTA_STRIP = 6
 
 # The real production map (Supabase source='manual'): #EEA8CB is the Skip colour.
@@ -69,13 +71,21 @@ def _n_code_labels(doc):
 
 
 def _klipp(doc):
-    """(page_index, line_x) of the one Klipp marking, or None."""
+    """(page_index, line_x) of the one Klipp cut LINE, or None.
+
+    Detects the dashed line itself, NOT the "Klipp" text. TIF-67 decoupled the two:
+    the text is skipped on a narrow sliver (room < KLIPP_TEXT_MIN_ROOM_PT) while the
+    line still draws, so keying cut-detection off the text — as this guard used to —
+    would now wrongly report "no cut" whenever the text was merely skipped. The line
+    is the true signal that the map reached the cut scan, which is what this guard
+    exists to pin.
+    """
     for i, pg in enumerate(doc):
-        if any(s["text"].strip().startswith("Kli") for s in _spans(pg)):
-            lines = [d for d in pg.get_drawings()
-                     if d.get("dashes") and d["dashes"] not in ("[] 0", "[]0")
-                     and any(it[0] == "l" for it in d["items"])]
-            return i, (lines[0]["rect"].x0 if lines else None)
+        lines = [d for d in pg.get_drawings()
+                 if d.get("dashes") and d["dashes"] not in ("[] 0", "[]0")
+                 and any(it[0] == "l" for it in d["items"])]
+        if lines:
+            return i, lines[0]["rect"].x0
     return None
 
 
@@ -121,8 +131,11 @@ def run():
 
     # ── C. genuinely empty map ───────────────────────────────────────────────
     # No map at all => legacy pink/orange fallback. On a GEOMETRIC partial that
-    # still yields the old behaviour: cut at pad_x (= content_w), the pre-existing
-    # geometric placement. This is the degradation path, and it must not regress.
+    # still yields the old behaviour: cut at the content boundary (= pad_x), now
+    # offset KLIPP_LINE_MARGIN_PT into the pink (TIF-67 Part 1). This is the
+    # degradation path, and it must not regress. KENTA_H is chosen wide enough that
+    # the margin comfortably fits (not a near-full sliver, which would be legitimately
+    # suppressed) so the cut line is genuinely present.
     c = _slice(KENTA, KENTA_W, KENTA_H, KENTA_STRIP, False, {}, True)
     c_labels, c_cut = _n_code_labels(c), _klipp(c)
     doc0 = fitz.open(KENTA)
@@ -130,16 +143,18 @@ def run():
     page_h  = slicer.PAGE_HEIGHT_M * (full_h / KENTA_H)
     content_w = full_h - (math.ceil(KENTA_H / slicer.PAGE_HEIGHT_M) - 1) * page_h
     doc0.close()
+    expected_x = content_w + slicer.KLIPP_LINE_MARGIN_PT
     print(f"C  empty map, geometric partial : labels={c_labels}  klipp={c_cut}  "
-          f"(expected cut at pad_x={content_w:.2f})")
+          f"(expected cut at pad_x+margin={expected_x:.2f})")
     if c_labels:
         fails.append(f"C: {c_labels} NCS labels drawn from an empty map")
     if c_cut is None:
-        fails.append("C: no Klipp on a geometric partial — the legacy fallback "
+        fails.append("C: no Klipp line on a geometric partial — the legacy fallback "
                      "regressed")
-    elif c_cut[1] is None or abs(c_cut[1] - content_w) > 1.0:
-        fails.append(f"C: cut at x={c_cut[1]}, expected pad_x={content_w:.2f} — "
-                     f"the empty-map path must reproduce the old geometric placement")
+    elif c_cut[1] is None or abs(c_cut[1] - expected_x) > 1.0:
+        fails.append(f"C: cut at x={c_cut[1]}, expected pad_x+margin={expected_x:.2f} "
+                     f"— the empty-map path must reproduce the geometric placement "
+                     f"plus the TIF-67 margin")
 
     for d in (a, b, c):
         d.close()
