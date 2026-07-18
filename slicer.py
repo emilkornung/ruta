@@ -34,6 +34,29 @@ ORANGE_R_MIN               = 220
 ORANGE_G_MIN, ORANGE_G_MAX = 90, 165
 ORANGE_B_MAX               = 60
 
+# Render scale for is_fully_background's colour sample (TIF-68). Was 0.05, which
+# rendered a full page to ~20-28 px and a partial to as few as ~15 — far too coarse
+# to be faithful: solid fills averaged out of the PINK_*/ORANGE_* boxes and a 1-2 px
+# anti-aliased edge was a large fraction of the sample, so genuinely ~100%-background
+# pages read as 40-83% background and were NOT excluded (they rendered as blank pink/
+# orange pages carrying only a page number). At 0.5 a full page is ~1200 px and the
+# sampled fraction tracks the true fraction to within a few percent, with a slight
+# pessimistic bias that errs toward rendering rather than dropping real content.
+BG_SAMPLE_SCALE = 0.5
+
+# Exclusion threshold for is_fully_background (TIF-68). The old code returned
+# ORANGE_THRESHOLD (0.85), but that was safe only because BG_SAMPLE_SCALE=0.05
+# under-counted so wildly that nothing was excluded. With the faithful, border-trimmed
+# sample, 0.85 would EXCLUDE pages that are 85-95% background but still carry a real
+# 5-15% content sliver (the tail of a design) — dropping printable artwork. TIF-68's
+# reported bug is specifically the UNAMBIGUOUS ~100%-background page; the 85-95% band
+# is a separate calibration concern (TIF-65). So this threshold targets only genuinely
+# empty pages. With the border trimmed, genuinely empty pages sample ~100% (even the
+# edge-bounded worst case) while pages carrying content sample <= ~95% — a wide gap.
+# 0.98 sits in it, biased high so a page is only dropped when it is essentially all
+# background (favouring "render" over "drop content", the safer error).
+FULLY_BG_THRESHOLD = 0.98
+
 # Pink padding color for partial pages (0–1 RGB)
 PINK_PAD_R, PINK_PAD_G, PINK_PAD_B = 0.957, 0.565, 0.710  # ≈ #F490B5
 
@@ -137,31 +160,42 @@ PAGE_NUM_EXCL_Y1 = 11.5  # pt from the top edge (baseline 10 plus pad)
 
 def is_fully_background(src_doc, src_page_num, clip):
     """
-    Render the clip region at low resolution and check if it's mostly
-    the light pink background (~R244 G144 B181) OR the orange background
-    (~R255 G128 B0). Returns True if >95% of pixels match either color,
-    meaning the page has no real content worth printing.
+    Render the clip region and check if it's mostly the light pink background
+    (~R244 G144 B181) OR the orange background (~R255 G128 B0). Returns True if
+    more than FULLY_BG_THRESHOLD of pixels match either colour, meaning the page has
+    no real content worth printing.
+
+    TIF-68: three coupled fixes for why genuinely-empty pages were not excluded.
+    (1) BG_SAMPLE_SCALE was 0.05, far too coarse to be faithful, so a ~100%-background
+    page read as 40-83% background. (2) The 1-px anti-aliased BORDER of the render
+    (the clip edge blended toward whatever lies outside it) reads as false content and,
+    on a small sample, is a large fraction — so even at a faithful scale an all-pink
+    page bounded by content/white read ~94%. That border is trimmed here, the same way
+    _find_cut_boundary trims it, so the sample reflects the page interior. (3) With a
+    faithful, trimmed sample the old 0.85 threshold would over-exclude pages holding a
+    real content sliver, so the exclusion threshold is FULLY_BG_THRESHOLD, high enough
+    to drop only genuinely empty pages. The colour boxes are unchanged.
     """
-    mat = fitz.Matrix(0.05, 0.05)  # tiny render — fast, just for color sampling
+    mat = fitz.Matrix(BG_SAMPLE_SCALE, BG_SAMPLE_SCALE)
     pix = src_doc[src_page_num].get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csRGB)
-    samples = pix.samples
-    total   = pix.width * pix.height
-    if total == 0:
+    if pix.width == 0 or pix.height == 0:
         return False
-    background_count = 0
-    for i in range(0, len(samples), 3):
-        r, g, b = samples[i], samples[i + 1], samples[i + 2]
-        is_pink = (r > PINK_R_MIN
-                   and PINK_G_MIN < g < PINK_G_MAX
-                   and PINK_B_MIN < b < PINK_B_MAX
-                   and r > g and r > b)
-        is_orange = (r > ORANGE_R_MIN
-                     and ORANGE_G_MIN < g < ORANGE_G_MAX
-                     and b < ORANGE_B_MAX
-                     and r > g and g > b)
-        if is_pink or is_orange:
-            background_count += 1
-    return (background_count / total) > ORANGE_THRESHOLD
+    arr = np.frombuffer(pix.samples, dtype=np.uint8) \
+            .reshape(pix.height, pix.width, pix.n)[:, :, :3].astype(np.int32)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    is_pink = ((r > PINK_R_MIN)
+               & (g > PINK_G_MIN) & (g < PINK_G_MAX)
+               & (b > PINK_B_MIN) & (b < PINK_B_MAX)
+               & (r > g) & (r > b))
+    is_orange = ((r > ORANGE_R_MIN)
+                 & (g > ORANGE_G_MIN) & (g < ORANGE_G_MAX)
+                 & (b < ORANGE_B_MAX)
+                 & (r > g) & (g > b))
+    bg = is_pink | is_orange
+    # Discard the 1-px border ring — partial-coverage raster artifact, not artwork.
+    if bg.shape[0] >= 3 and bg.shape[1] >= 3:
+        bg = bg[1:-1, 1:-1]
+    return bool(bg.mean() > FULLY_BG_THRESHOLD)
 
 
 def rotate_pdf_90(pdf_bytes, clockwise=True):
@@ -879,10 +913,10 @@ def slice_one_strip(args):
 
         # The content scan says the strip's content ends on a page that
         # is_fully_background() then excluded from rendering. Those two should
-        # never disagree — a page holding content is not ~85%+ background — but
-        # that sampler reads only ~21 pixels per page (TIF-65), so near its
-        # threshold it can be wrong. Drawing a cut line derived from a page nobody
-        # prints would be worse than drawing none: suppress, and say so.
+        # never disagree — a page holding content is not ~85%+ background — but the
+        # sampler is a coarse low-res colour count (TIF-65/TIF-68), so near its
+        # threshold it can still be wrong. Drawing a cut line derived from a page
+        # nobody prints would be worse than drawing none: suppress, and say so.
         if cut_page is not None and cut_page not in rendered_pages:
             print(f"    WARNING: strip {s + 1} — content boundary falls on page "
                   f"{cut_page + 1}, which is_fully_background() excluded from "
