@@ -104,12 +104,15 @@ KLIPP_MIN_PINK_PT = 12.0     # pt — total pink below which nothing is marked a
                              # 6.0 -> 12.0 (TIF-67); Emil is iterating this on real
                              # prints — keep adjustable.
 
-KLIPP_LINE_MARGIN_PT = 2.0   # pt — TIF-67 Part 1. The dashed cut line sits this far
+KLIPP_LINE_MARGIN_PT = 4.0   # pt — TIF-67 Part 1. The dashed cut line sits this far
                              # INTO the pink, past where content stops (b*), so it
                              # never rides on the artwork edge. Folded into cut_x inside
                              # _find_cut_boundary AFTER the KLIPP_MIN_PINK_PT gate above
                              # has already guaranteed enough pink for it. Emit-time value;
                              # Emil expects to iterate it on real prints — keep adjustable.
+                             # Doubled 2.0 -> 4.0 (TIF-67 reopened); still a fixed PDF-pt
+                             # value, not a physical-distance conversion, and safely below
+                             # KLIPP_MIN_PINK_PT.
 
 # Sizing philosophy (TIF-27 round 3): operators read labels from inches away,
 # so there is no legibility floor — font size is purely a computational tool to
