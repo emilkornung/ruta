@@ -15,9 +15,21 @@ page and on top of the orange page number, so the whole marking looked absent.
 
 This guard deliberately forces partial pages at several leftover widths —
 including the NARROW / near-full case that actually broke — in BOTH the default
-(rotate=270) and ruta_nedre (rotate=90) slicing modes, and asserts on every
-partial page that the marking is: present (pink + dashed line + "Klipp" text),
-fully on-page, and clear of the page-number glyph.
+(rotate=270) and ruta_nedre (rotate=90) slicing modes.
+
+TIF-67 UPDATE
+-------------
+TIF-57 originally required the "Klipp" text on every partial page, falling back
+to a LEFT-of-line placement on narrow slivers. TIF-67 reversed that: the text now
+ALWAYS sits to the RIGHT of the line, and if there is less than
+KLIPP_TEXT_MIN_ROOM_PT of room to the right it is SKIPPED entirely (the line still
+draws). So the contract this guard enforces is now:
+  - pink pad + dashed line present on every partial page (unchanged);
+  - the "Klipp" text is NEVER left of the line (hard rule — any left placement is
+    a bug), and when present is fully on-page and clear of the page-number glyph;
+  - on a WIDE partial the text must be present; on a NARROW/near-full partial it
+    may legitimately be skipped, but only when the room to the right really is
+    below the threshold (a skip with ample room would be a bug).
 
 Not part of the production pipeline. Passes an empty colour map (labels are
 irrelevant to the cut marking). Exits non-zero if any partial page fails.
@@ -47,31 +59,50 @@ def _has_pink_fill(page):
     return False
 
 
-def _has_dashed_line(page):
+def _dashed_line_x(page):
+    """x of the dashed cut line, or None if absent."""
     for dr in page.get_drawings():
         d = dr.get("dashes")
         if d and d not in ("[] 0", "[]0") and any(it[0] == "l" for it in dr["items"]):
-            return True
-    return False
+            return dr["rect"].x0
+    return None
 
 
-def check_page(page, page_label):
+def check_page(page, page_label, narrow):
     """Return list of failure strings for one partial page (empty == OK)."""
     fails = []
     w = page.rect.width
     sp = _spans(page)
     klipp = next((s for s in sp if s["text"].strip().startswith("Kli")), None)
     pnum  = next((s for s in sp if s["text"].strip().isdigit()), None)
+    line_x = _dashed_line_x(page)
 
     if not _has_pink_fill(page):
         fails.append("pink padding rect missing")
-    if not _has_dashed_line(page):
+    if line_x is None:
         fails.append("dashed cut line missing")
+
     if klipp is None:
-        fails.append('"Klipp" text missing')
-        return fails  # nothing more to check without the text
+        # TIF-67: a skip is allowed ONLY on a narrow partial whose room to the right
+        # of the line is genuinely below the threshold. A skip anywhere else — or a
+        # skip with ample room — is a bug (text vanished when it should have fit).
+        if line_x is None:
+            return fails  # no line at all; nothing further to say about the text
+        right_limit = w - slicer.PAGE_NUM_EXCL_W - 2.0
+        room = right_limit - line_x
+        if not narrow:
+            fails.append(f'"Klipp" text missing on a WIDE partial (room to right '
+                         f'= {room:.1f}pt, threshold {slicer.KLIPP_TEXT_MIN_ROOM_PT})')
+        elif room >= slicer.KLIPP_TEXT_MIN_ROOM_PT:
+            fails.append(f'"Klipp" text skipped but room to right = {room:.1f}pt '
+                         f'>= threshold {slicer.KLIPP_TEXT_MIN_ROOM_PT} — should fit')
+        return fails
 
     kb = klipp["bbox"]
+    # HARD RULE (TIF-67): the text must ALWAYS be to the RIGHT of the line.
+    if line_x is not None and kb[0] < line_x - 0.5:
+        fails.append(f'"Klipp" is LEFT of the cut line (x0={kb[0]:.1f} < line '
+                     f'{line_x:.1f}) — TIF-67 forbids left placement entirely')
     if kb[0] < -0.5 or kb[2] > w + 0.5:
         fails.append(f'"Klipp" off-page: x[{kb[0]:.1f}..{kb[2]:.1f}] page width {w:.1f}')
     if pnum is not None:
@@ -131,7 +162,7 @@ def run():
         for i, pg in partial_pages:
             total_pages += 1
             saw_narrow |= narrow
-            fails = check_page(pg, f"{label} page {i + 1}")
+            fails = check_page(pg, f"{label} page {i + 1}", narrow)
             status = "OK  " if not fails else "FAIL"
             marker = " [narrow]" if narrow else ""
             print(f"  {status} {label} page {i + 1}{marker}")

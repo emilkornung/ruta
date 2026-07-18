@@ -66,9 +66,27 @@ MIN_PATCH_PX          = 10     # discard connected components smaller than this 
                                # to label every patch a painter can actually see.
 LABEL_RENDER_SCALE    = 2.0    # pixmap render scale used for color analysis
 
-CUT_EDGE_EPS = 1.0   # pt — content closer than this to a page's outer edge counts
-                     # as running off the edge: there is no leftover to cut, so no
-                     # Klipp line. Mirrors is_partial's own `page_h_pts - 1` slack.
+# TIF-67 (rev): ONE upfront space gate for the whole marking. If the total pink
+# leftover — from where content stops (b*) to the page's outer edge — is at most
+# KLIPP_MIN_PINK_PT, there is not enough fabric to mark: suppress the ENTIRE marking
+# (line AND text together) before any margin or text-room logic runs. This is a
+# single decision in _find_cut_boundary, replacing the two former independent checks
+# (a per-line "does the 2pt margin fit" edge test + a separate per-text room test).
+# It also subsumes the old seam/edge case: content running to the page edge leaves
+# ~0 pink, well under the threshold. The 1/LABEL_RENDER_SCALE border-trim pull-in is
+# ~0.5pt, far inside this margin, so the gate can never invent a cut with no fabric.
+KLIPP_MIN_PINK_PT = 12.0     # pt — total pink below which nothing is marked at all.
+                             # Must exceed KLIPP_LINE_MARGIN_PT (a marking needs the
+                             # margin plus a little drawable pink beyond it). Raised
+                             # 6.0 -> 12.0 (TIF-67); Emil is iterating this on real
+                             # prints — keep adjustable.
+
+KLIPP_LINE_MARGIN_PT = 2.0   # pt — TIF-67 Part 1. The dashed cut line sits this far
+                             # INTO the pink, past where content stops (b*), so it
+                             # never rides on the artwork edge. Folded into cut_x inside
+                             # _find_cut_boundary AFTER the KLIPP_MIN_PINK_PT gate above
+                             # has already guaranteed enough pink for it. Emit-time value;
+                             # Emil expects to iterate it on real prints — keep adjustable.
 
 # Sizing philosophy (TIF-27 round 3): operators read labels from inches away,
 # so there is no legibility floor — font size is purely a computational tool to
@@ -81,6 +99,28 @@ LABEL_FONT_TECH_MIN   = 0.1    # pt — technical safety floor only (guards agai
                                # a literal 0/negative size). NOT a legibility
                                # judgment; hitting it is reported ("forced") and
                                # means a patch held text in near-zero space.
+
+# "Klipp" cut-line text (TIF-67 Part 2). HARD RULE: the label ALWAYS sits to the
+# RIGHT of the dashed line, never left, under any circumstance — this reverses
+# TIF-57's thin-sliver left-of-line fallback, which is no longer acceptable. These
+# knobs govern ONLY whether/how large the text is; they never touch the line, which
+# always draws per KLIPP_LINE_MARGIN_PT regardless of whether the text fits.
+KLIPP_FONT_DEFAULT     = 6.0   # pt — the label's default size (as in TIF-57)
+KLIPP_TEXT_GAP_PT      = 3.0   # pt — breathing gap between the line and the text start
+                               # (the original TIF-57 `cut_x + 3` offset, named)
+# Two DISTINCT text floors — read the units, they are not the same knob:
+KLIPP_TEXT_MIN_ROOM_PT = 4.0   # pt of WIDTH — minimum room to the RIGHT of the line
+                               # (up to the page-number exclusion zone) before the text
+                               # is even attempted. Below this width the text is skipped
+                               # and the line stands alone. A horizontal-space gate.
+KLIPP_MIN_FONT_SIZE_PT = 4.0   # pt of FONT SIZE — the smallest the label may shrink to.
+                               # If "Klipp" cannot fit the available width at >= this
+                               # font size, the text is skipped rather than shrunk into
+                               # illegibility (this REPLACES the old LABEL_FONT_TECH_MIN
+                               # 0.1pt floor for the Klipp label — the colour labeler
+                               # still uses its own 0.1 floor). Distinct from
+                               # KLIPP_TEXT_MIN_ROOM_PT: that is a width in pt, this is a
+                               # glyph size in pt. Both STARTING values; Emil will iterate.
 
 # Page-number exclusion zone (TIF-27 round 5, restores the legacy ruta.py
 # labeler's dead zone in rect form). The orange page number is inserted AFTER
@@ -365,9 +405,16 @@ def _find_cut_boundary(src_doc, src_page_num, x0, x1, full_h, page_h_pts,
 
     which is exactly where the old code drew the line — at output_x = content_w,
     the seq-position where the source CLIP runs out. This function swaps that for
-    the seq-position where the CONTENT runs out. The geometric case then falls
-    out as a special case: content reaching the clip edge yields cut_x =
-    content_w, i.e. the old behaviour, byte for byte.
+    the seq-position where the CONTENT runs out. The geometric case falls out as a
+    special case: content reaching the clip edge yields the content boundary at
+    content_w (then offset right by KLIPP_LINE_MARGIN_PT, see below).
+
+    TIF-67 (rev): the returned cut_x is the content boundary shifted
+    KLIPP_LINE_MARGIN_PT into the pink, so the line never rides the artwork edge.
+    One upfront gate decides the whole marking first: if the total pink leftover to
+    the page edge is <= KLIPP_MIN_PINK_PT, this returns None and NOTHING is marked
+    (line and text both). That single threshold covers content running off the page,
+    content ending on a page seam, and too-little-pink-for-the-margin alike.
     """
     S    = LABEL_RENDER_SCALE
     pix  = src_doc[src_page_num].get_pixmap(
@@ -399,8 +446,8 @@ def _find_cut_boundary(src_doc, src_page_num, x0, x1, full_h, page_h_pts,
     #
     # Trimming all four sides covers both slicing modes (the sequence's far end is
     # row 0 under rotate=270, the last row under rotate=90). Where real content
-    # does reach an edge, this pulls the boundary in by just 1/S pt — which
-    # CUT_EDGE_EPS absorbs — so it can never invent a cut line where there is
+    # does reach an edge, this pulls the boundary in by just 1/S pt — far inside the
+    # KLIPP_MIN_PINK_PT gate below — so it can never invent a cut line where there is
     # nothing to cut.
     if content.shape[0] >= 3 and content.shape[1] >= 3:
         content[0, :]  = content[-1, :] = False
@@ -436,16 +483,24 @@ def _find_cut_boundary(src_doc, src_page_num, x0, x1, full_h, page_h_pts,
         boundary_seq = full_h - r_last / S
         seq_mid      = full_h - (r_last + 0.5) / S
 
-    pn    = min(max(int(seq_mid // page_h_pts), 0), num_pages - 1)
-    cut_x = boundary_seq - pn * page_h_pts
+    pn     = min(max(int(seq_mid // page_h_pts), 0), num_pages - 1)
+    b_star = boundary_seq - pn * page_h_pts       # raw content boundary, no margin
 
-    # Content runs out to the page's outer edge, so there is no leftover fabric
-    # to cut. This also absorbs content ending exactly on a page seam, where
-    # cut_x lands at page_h_pts on the page the content is on: suppress rather
-    # than draw a degenerate line flush with the page edge.
-    if cut_x >= page_h_pts - CUT_EDGE_EPS:
+    # TIF-67 (rev): ONE upfront gate for the whole marking, before any margin logic.
+    # The total pink leftover from the content boundary to this page's outer edge is
+    # page_h_pts - b_star. If that is at most KLIPP_MIN_PINK_PT there is not enough
+    # fabric to mark — suppress the ENTIRE marking (returning None drops both the line
+    # AND the text downstream). This subsumes the old cases in one decision: content
+    # running to the edge (pink ~0), content ending on a page seam (pink ~0), and "not
+    # enough pink for the 2pt margin" (pink < margin) are all just small-pink cases.
+    if page_h_pts - b_star <= KLIPP_MIN_PINK_PT:
         return None
 
+    # Nudge the line KLIPP_LINE_MARGIN_PT into the pink, past where content stops, so
+    # it never rides the artwork edge. Added AFTER pn is fixed and AFTER the gate has
+    # guaranteed enough pink, so it can only push toward THIS page's own outer edge —
+    # never onto the next page, never negative, and never flush with the edge.
+    cut_x = b_star + KLIPP_LINE_MARGIN_PT
     return pn, cut_x
 
 
@@ -762,43 +817,57 @@ def slice_one_strip(args):
                 shape.commit()
 
             # Dashed cut line + "Klipp" — drawn on the ONE page per strip that
-            # holds the content boundary found by pass A, at cut_x. Formerly this
-            # was gated on is_partial and drawn at pad_x, which only ever fired on
-            # a geometric leftover; it could not see a design that ends mid-page
-            # inside its own painted background. Where the old trigger did fire,
-            # cut_x == pad_x and the output is unchanged.
+            # holds the content boundary found by pass A, at cut_x (which already
+            # carries KLIPP_LINE_MARGIN_PT, TIF-67 Part 1). Formerly gated on
+            # is_partial and drawn at pad_x, which only ever fired on a geometric
+            # leftover; it could not see a design ending mid-page inside its own
+            # painted background.
             if cut_page is not None and page_num == cut_page:
-                # "Klipp" anchor (TIF-57): originally fixed at (cut_x + 3, 10),
-                # i.e. just right of the cut line inside the pink. On a near-full
-                # partial the pink is a thin sliver at the right edge, so that spot
-                # runs the text off the page AND over the top-right page number —
-                # it looked like the whole marking was missing. Keep the original
-                # right-of-line placement whenever the text fits fully on-page and
-                # clears the page-number footprint (PAGE_NUM_EXCL_W); otherwise
-                # anchor it just LEFT of the cut line instead. Only the anchor
-                # moves — the dashed line, font, size and colour below are unchanged.
-                klipp_w   = fitz.get_text_length("Klipp", fontsize=6)
-                pagenum_x = page_h_pts - PAGE_NUM_EXCL_W - 2.0  # left of page-number zone, w/ gap
-                if cut_x + 3 + klipp_w <= pagenum_x:
-                    klipp_pt = fitz.Point(cut_x + 3, 10)
-                else:
-                    # Pink sliver too thin: anchor just left of the cut line, and
-                    # keep the right edge clear of the page-number zone too (the
-                    # line itself can sit inside that zone on a near-full partial).
-                    right_edge = min(cut_x - 3, pagenum_x)
-                    klipp_pt   = fitz.Point(max(2.0, right_edge - klipp_w), 10)
-
+                # The dashed line ALWAYS draws here — it is never affected by whether
+                # the text below fits (TIF-67 Part 2, rule 3). If cut_x had left too
+                # little pink for the margin, _find_cut_boundary would already have
+                # suppressed the whole marking (cut_page/cut_x would be None).
                 shape = new_page.new_shape()
                 shape.draw_line(fitz.Point(cut_x, 0), fitz.Point(cut_x, x1 - x0))
                 shape.finish(color=(0.15, 0.15, 0.15), width=1.0, dashes="[4 4] 0")
                 shape.commit()
 
-                new_page.insert_text(
-                    klipp_pt,
-                    "Klipp",
-                    fontsize = 6,
-                    color    = (0.15, 0.15, 0.15),
-                )
+                # "Klipp" text — HARD RULE (TIF-67 Part 2): ALWAYS to the RIGHT of
+                # the line, never left, under any circumstance (this removes TIF-57's
+                # thin-sliver left-of-line fallback for good). The right boundary is
+                # the page-number exclusion zone: the text baseline (y=10) sits inside
+                # that zone's y-band, so the page number is the binding limit, same as
+                # TIF-57 used. "room" is the width available to the right of the line,
+                # before that zone.
+                right_limit = page_h_pts - PAGE_NUM_EXCL_W - 2.0
+                room        = right_limit - cut_x
+                if room >= KLIPP_TEXT_MIN_ROOM_PT:
+                    # Width gate passed. Place the text a small gap right of the line
+                    # and shrink to fit — but only down to KLIPP_MIN_FONT_SIZE_PT, a
+                    # legibility floor (NOT the colour labeler's 0.1pt technical floor).
+                    # Step by LABEL_FONT_SHRINK; the ladder bottoms out at the font
+                    # floor. Pick the largest size whose "Klipp" fits the available
+                    # width; if even the floor size is too wide, SKIP the text rather
+                    # than shrink it into illegibility. The line still stands, and the
+                    # text is never placed left — skipping is the only fallback.
+                    text_x0 = cut_x + KLIPP_TEXT_GAP_PT
+                    avail   = right_limit - text_x0
+                    sizes   = [KLIPP_FONT_DEFAULT]
+                    while sizes[-1] * LABEL_FONT_SHRINK > KLIPP_MIN_FONT_SIZE_PT:
+                        sizes.append(round(sizes[-1] * LABEL_FONT_SHRINK, 3))
+                    if sizes[-1] > KLIPP_MIN_FONT_SIZE_PT:
+                        sizes.append(KLIPP_MIN_FONT_SIZE_PT)
+                    chosen = next(
+                        (sz for sz in sizes
+                         if fitz.get_text_length("Klipp", fontsize=sz) <= avail),
+                        None)
+                    if chosen is not None:
+                        new_page.insert_text(
+                            fitz.Point(text_x0, 10),
+                            "Klipp",
+                            fontsize = chosen,
+                            color    = (0.15, 0.15, 0.15),
+                        )
 
             # Small orange page number, tight to top right corner
             new_page.insert_text(
