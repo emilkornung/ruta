@@ -126,6 +126,25 @@ LABEL_FONT_TECH_MIN   = 0.1    # pt — technical safety floor only (guards agai
                                # judgment; hitting it is reported ("forced") and
                                # means a patch held text in near-zero space.
 
+MIN_LABEL_PATCH_SIZE_PT = 1.0  # pt — TIF-69. Reuses the SAME distance-transform /
+                               # inscribed-circle metric that seeds the font-sizing
+                               # ladder above (r_pts = dt.max() / S, computed once per
+                               # patch) as an upfront gate: a patch whose inscribed
+                               # radius does not clear this many points is skipped
+                               # entirely, before the shrink-to-LABEL_FONT_TECH_MIN
+                               # ladder runs at all. Below this size a patch is print-
+                               # floor dust, not a labelable shape -- forcing a label
+                               # onto it (down at the 0.1pt technical floor) produces
+                               # illegible ink jammed into/over neighbouring paint, not
+                               # a useful mark. This is a DIFFERENT gate from MIN_PATCH_PX
+                               # (a pixel-COUNT dust filter on the raw component; this is
+                               # a physical-SIZE filter on the largest inscribed shape a
+                               # label could actually sit inside). 1.0pt is a starting
+                               # value only -- Emil expects this to move as real prints
+                               # show it skipping too much or too little. Keep it here,
+                               # as the single source of truth; do not inline or
+                               # duplicate this threshold elsewhere.
+
 # "Klipp" cut-line text (TIF-67 Part 2). HARD RULE: the label ALWAYS sits to the
 # RIGHT of the dashed line, never left, under any circumstance — this reverses
 # TIF-57's thin-sliver left-of-line fallback, which is no longer acceptable. These
@@ -552,7 +571,11 @@ def _label_colors_on_page(page, color_map):
          render drift, same principle as the pink/orange background bands.
       3. Find separate visible patches with scipy.ndimage.label.
       4. Discard any patch smaller than MIN_PATCH_PX (filters anti-alias noise).
-      5. Every surviving patch receives EXACTLY ONE label — no skips.
+      5. Compute r_pts (the inscribed-circle radius, via distance transform) for
+         each surviving patch. If r_pts < MIN_LABEL_PATCH_SIZE_PT (TIF-69), skip
+         the label entirely — before any sizing/placement logic runs. This is
+         true print-floor dust, not a space a label can usefully occupy.
+      6. Every OTHER surviving patch receives EXACTLY ONE label — no skips.
 
     Placement/sizing per patch (fit-verified, collision-aware, no legibility
     floor — operators read labels from inches away):
@@ -571,11 +594,12 @@ def _label_colors_on_page(page, color_map):
         still inside its own patch, may touch another label) and counted, so
         a zero-space cluster is visible in the summary rather than silent.
 
-    Returns {code: {"count", "font_sizes", "rects", "placement", "forced"}}
-    for inspection/validation ("rects" are glyph bboxes in page points,
-    aligned with "font_sizes"; "placement" entries are "fit"/"forced").
-    Keyed by paint CODE (not hex) since round 4. The slicing path ignores
-    the return value.
+    Returns {code: {"count", "font_sizes", "rects", "placement", "forced",
+    "skipped_small"}} for inspection/validation ("rects" are glyph bboxes in
+    page points, aligned with "font_sizes"; "placement" entries are
+    "fit"/"forced"; "skipped_small" counts patches skipped under
+    MIN_LABEL_PATCH_SIZE_PT, TIF-69). Keyed by paint CODE (not hex) since
+    round 4. The slicing path ignores the return value.
     """
     summary = {}
 
@@ -638,9 +662,20 @@ def _label_colors_on_page(page, color_map):
     for npx, code, sl, sub_mask, dt, text_color in patches:
         entry = summary.setdefault(
             code, {"count": 0, "font_sizes": [], "rects": [], "placement": [],
-                   "forced": 0})
+                   "forced": 0, "skipped_small": 0})
 
         r_pts = float(dt.max()) / S
+
+        # TIF-69: top-of-ladder size gate, using the SAME r_pts metric the sizing
+        # ladder below is about to consume. A patch this small is print-floor
+        # dust, not a labelable shape — skip entirely rather than proceeding
+        # into the shrink-to-LABEL_FONT_TECH_MIN logic (which would force an
+        # illegible/overlapping label onto it). No sizing, no placement, no
+        # collision bookkeeping for this patch at all.
+        if r_pts < MIN_LABEL_PATCH_SIZE_PT:
+            entry["skipped_small"] += 1
+            continue
+
         wpp   = fitz.get_text_length(code, fontname="helv", fontsize=1.0) or 1.0
         # Start at the modest default, pre-capped by a cheap geometric estimate
         # of what the inscribed circle can hold (the fit check verifies anyway;
@@ -722,7 +757,10 @@ def _label_colors_on_page(page, color_map):
         entry["placement"].append("forced" if forced else "fit")
         entry["forced"]     += 1 if forced else 0
 
-    return {h: e for h, e in summary.items() if e["count"]}
+    # Keep entries with only skipped_small patches (TIF-69): a code whose every
+    # patch was below MIN_LABEL_PATCH_SIZE_PT would otherwise vanish from the
+    # summary entirely, hiding those skips from validation/reporting.
+    return {h: e for h, e in summary.items() if e["count"] or e["skipped_small"]}
 
 
 def extract_pdf_colors(pdf_bytes):
