@@ -1,13 +1,15 @@
 """
-_validate_klipp_margin.py — permanent guard for TIF-67: the 2 pt content-to-line
-margin and the right-only / shrink / skip rules for the "Klipp" text.
+_validate_klipp_margin.py — permanent guard for TIF-67: the content-to-line margin
+(KLIPP_LINE_MARGIN_PT, 4 pt since TIF-67 was reopened; was 2 pt) and the right-only
+/ shrink / skip rules for the "Klipp" text.
 
 WHY THIS EXISTS
 ---------------
 TIF-67 refined the content-driven Klipp marking (on top of TIF-57):
 
   Part 1 — the dashed line no longer sits flush at the content boundary b*; it is
-           nudged KLIPP_LINE_MARGIN_PT (2 pt) INTO the pink, away from the artwork.
+           nudged KLIPP_LINE_MARGIN_PT (4 pt, doubled from 2 pt when TIF-67 was
+           reopened) INTO the pink, away from the artwork.
 
   Part 2 — the "Klipp" text ALWAYS sits to the RIGHT of the line (TIF-57's
            left-of-line sliver fallback is gone for good).
@@ -30,6 +32,9 @@ WHAT IT ASSERTS
   1. MARGIN APPLIED: on a comfortable mid-page boundary the drawn line sits exactly
      KLIPP_LINE_MARGIN_PT to the right of the content boundary (proven by toggling
      the constant to 0 and measuring the shift — no rasterisation guesswork).
+  1b. MARGIN DOUBLED 2 -> 4 pt (TIF-67 reopened): on the same boundary, toggling the
+     constant back to the old 2 pt shows the rendered line move exactly 2 pt LESS into
+     the pink — i.e. the doubled value pushes the drawn line 2 pt further from content.
   2. TOTAL-PINK SUPPRESSION (the ~5 pt case): with only ~5 pt of total pink — under
      any gate value tried here — the OLD (pre-gate) behaviour drew the line and merely
      skipped the text; the unified gate now suppresses BOTH. Shown by toggling
@@ -176,6 +181,51 @@ def run():
             fails.append("1 MARGIN: text missing though room is ample")
         elif line_x is not None and kb[0] < line_x - 0.5:
             fails.append(f"1 MARGIN: text LEFT of line ({kb[0]:.1f} < {line_x:.1f})")
+
+    # ── 1b. MARGIN DOUBLED 2 -> 4 pt (TIF-67 reopened) ───────────────────────
+    # The margin constant was doubled 2.0 -> 4.0. Prove the change actually moves the
+    # drawn cut line 2 pt FURTHER into the pink (away from content) by toggling
+    # KLIPP_LINE_MARGIN_PT back to the old 2.0 and measuring the rendered line's shift
+    # against the real 4.0 — same gate-toggle technique as the threshold proofs, on
+    # the same comfortable D=200 boundary so b* is identical for both and the only
+    # thing that moves is the margin.
+    OLD_MARGIN = 2.0
+    assert abs(slicer.KLIPP_LINE_MARGIN_PT - 4.0) < 1e-9, \
+        "this case assumes the margin was doubled to 4.0"
+    D = 200.0
+    pdf = make_design(D)
+    doc = render(pdf)
+    line_new = _dashed_line_x(doc[0]);  doc.close()
+
+    saved = slicer.KLIPP_LINE_MARGIN_PT
+    try:
+        slicer.KLIPP_LINE_MARGIN_PT = OLD_MARGIN     # the pre-reopen value
+        doc = render(pdf)
+        line_old = _dashed_line_x(doc[0]);  doc.close()
+    finally:
+        slicer.KLIPP_LINE_MARGIN_PT = saved
+
+    print(f"1b MARGIN DOUBLED 2->4  D={D:.1f}:")
+    print(f"    margin {OLD_MARGIN}pt (old)     : rendered line x="
+          f"{None if line_old is None else round(line_old, 2)} (expect ~{D + OLD_MARGIN:.1f})")
+    print(f"    margin {MARGIN:.0f}pt (this rev): rendered line x="
+          f"{None if line_new is None else round(line_new, 2)} (expect ~{D + MARGIN:.1f})")
+    if line_old is None or line_new is None:
+        fails.append(f"1b DOUBLE: expected a line at both margins, got "
+                     f"old={line_old} new={line_new}")
+    else:
+        drawn_shift = line_new - line_old
+        print(f"    drawn line shifted {drawn_shift:.3f} pt further into pink "
+              f"(expect {MARGIN - OLD_MARGIN})")
+        if abs(drawn_shift - (MARGIN - OLD_MARGIN)) > 0.01:
+            fails.append(f"1b DOUBLE: rendered line shifted {drawn_shift:.3f} pt, "
+                         f"expected {MARGIN - OLD_MARGIN}")
+        if abs(line_old - (D + OLD_MARGIN)) > 1.0:
+            fails.append(f"1b DOUBLE: old-margin line at {line_old:.2f}, "
+                         f"expected ~{D + OLD_MARGIN:.2f}")
+        if abs(line_new - (D + MARGIN)) > 1.0:
+            fails.append(f"1b DOUBLE: new-margin line at {line_new:.2f}, "
+                         f"expected ~{D + MARGIN:.2f}")
 
     # ── 2. TOTAL-PINK SUPPRESSION — the ~5 pt case ───────────────────────────
     # ~5 pt of total pink: between the 2 pt the margin needs and the 4 pt the text
