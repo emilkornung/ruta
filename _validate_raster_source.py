@@ -11,6 +11,7 @@ labeling / unknown_colors.
 All artifacts land in raster_test/, which is wiped at the start of every run.
 """
 
+import hashlib
 import io
 import os
 import shutil
@@ -117,15 +118,37 @@ def make_photo_image(path, px_w, px_h, fmt=None):
     return path
 
 
-def make_alpha_png(path, px_w, px_h):
-    """A PNG with a genuinely transparent region (right half)."""
+def make_alpha_png(path, px_w, px_h, content_frac=0.75, opaque_bg=None):
+    """
+    A design whose leftover region is TRANSPARENT (top `1 - content_frac`), with
+    artwork below it.
+
+    opaque_bg: when given a hex, the leftover is painted that colour instead of
+    left transparent. That produces the control image for the Fix 2 comparison —
+    flattening transparency onto PINK_PAD must give the same result as a design
+    that painted its own PINK_PAD leftover in the first place.
+    """
     doc = fitz.open()
     page = doc.new_page(width=px_w, height=px_h)
+    split = px_h * (1 - content_frac)
+
     sh = page.new_shape()
-    sh.draw_rect(fitz.Rect(0, 0, px_w * 0.5, px_h))
-    sh.finish(fill=_hexf("#1E7534"), color=None)
+    if opaque_bg:
+        sh.draw_rect(fitz.Rect(0, 0, px_w, split))
+        sh.finish(fill=_hexf(opaque_bg), color=None)
+    sh.draw_rect(fitz.Rect(0, split, px_w, px_h))
+    sh.finish(fill=_hexf("#D4D1CD"), color=None)
     sh.commit()
-    pix = page.get_pixmap(colorspace=fitz.csRGB, alpha=True)
+
+    sh = page.new_shape()
+    for j in range(4):
+        x = px_w * (0.06 + 0.23 * j)
+        sh.draw_rect(fitz.Rect(x, split + (px_h - split) * 0.2,
+                               x + px_w * 0.16, split + (px_h - split) * 0.6))
+        sh.finish(fill=_hexf("#1E7534"), color=None)
+    sh.commit()
+
+    pix = page.get_pixmap(colorspace=fitz.csRGB, alpha=not opaque_bg)
     pix.save(path, output="png")
     doc.close()
     return path
@@ -172,6 +195,26 @@ def sample_rgb(pdf_bytes, page_idx, fx, fy, scale=2.0):
     py = min(int(fy * pix.height), pix.height - 1)
     doc.close()
     return tuple(int(v) for v in arr[py, px])
+
+
+def render_digest(result):
+    """
+    Full-strength comparison: hash the RENDERED pixels of every strip page and the
+    grid. Deliberately not a content-stream or file-byte hash — this compares what
+    actually prints.
+    """
+    h = hashlib.sha256()
+    for s in result["strips"]:
+        h.update(s["filename"].encode())
+        d = fitz.open(stream=s["bytes"], filetype="pdf")
+        for p in d:
+            h.update(p.get_pixmap(matrix=fitz.Matrix(3, 3), colorspace=fitz.csRGB).samples)
+        d.close()
+    d = fitz.open(stream=result["grid_pdf"], filetype="pdf")
+    for p in d:
+        h.update(p.get_pixmap(colorspace=fitz.csRGB).samples)
+    d.close()
+    return h.hexdigest()
 
 
 def save_result(tag, result):
@@ -271,15 +314,16 @@ def t_structure():
 
 def t_page_numbering(res):
     hdr("STEP 2b — page numbering on raster-sourced pages")
+    # With FIX 1 suppressing colour labels on raster, the ONLY text left on the
+    # page is the page number — so this can assert the exact expected value rather
+    # than merely "some digit is present".
     ok = True
     for s in res["strips"][:2]:
         texts = page_texts(s["bytes"])
-        nums = []
-        for words in texts:
-            nums.append([w for w in words if w.isdigit()])
+        nums = [[w for w in words if w.isdigit()] for words in texts]
         print(f"    {s['filename']}: digit tokens per page = {nums}")
-        ok &= check(f"{s['filename']} every rendered page carries a page number",
-                    all(n for n in nums), str(nums))
+        ok &= check(f"{s['filename']} page N carries exactly the number N",
+                    nums == [[str(i + 1)] for i in range(len(nums))], str(nums))
     RESULTS.append(("page numbering", ok))
 
 
@@ -379,6 +423,18 @@ def t_colour_labeling(dflt, jpg):
     ok &= check("extract_pdf_colors() returns an EMPTY set (no vector drawings)",
                 found == set(), f"got {sorted(found)!r}")
 
+    # The PINK_PAD underlay IS a vector fill, so emitting it unconditionally would
+    # make the above report a phantom #F490B5 on every raster job. It is therefore
+    # laid down only for images that actually carry alpha — assert both halves.
+    alpha_src = make_alpha_png(os.path.join(OUT, "src_alpha_probe.png"), 300, 600)
+    with open(alpha_src, "rb") as f:
+        alpha_pdf = image_to_pdf(f.read(), 6.0, 12.0)
+    af = extract_pdf_colors(alpha_pdf)
+    print(f"    opaque source drawings={sorted(found)}  "
+          f"alpha source drawings={sorted(af)}")
+    ok &= check("underlay emitted ONLY for images with alpha",
+                af == {"#F490B5"}, f"got {sorted(af)!r}")
+
     ok &= check("unknown_colors is empty, not 'every pixel unknown'",
                 dflt["unknown_colors"] == [], f"got {dflt['unknown_colors']}")
 
@@ -405,16 +461,18 @@ def t_colour_labeling(dflt, jpg):
                 vres["unknown_colors"] == ["#FF00FF"] and vres["colors_analyzed"] is True,
                 str(vres["unknown_colors"]))
 
-    # Labels are pixel-based (_label_colors_on_page renders the OUTPUT page), so
-    # they should appear on raster content despite extract_pdf_colors seeing none.
+    # FIX 1: colour labels must NEVER be drawn on a raster source. This is not
+    # self-enforcing — _label_colors_on_page renders the OUTPUT page and would
+    # happily label raster artwork (it did, before the gate) — so this asserts the
+    # gate in run_slice() is actually holding.
     codes = set(v for v in COLOUR_MAP.values() if v != "Skip")
     seen = set()
     for s in dflt["strips"]:
         for words in page_texts(s["bytes"]):
             seen |= (set(words) & codes)
-    print(f"    NCS codes actually printed on raster strips: {sorted(seen)}")
-    ok &= check("colour labels ARE drawn on raster pages (pixel-based labeler)",
-                len(seen) > 0, f"codes seen: {sorted(seen)}")
+    print(f"    NCS codes printed on raster strips: {sorted(seen)} (must be empty)")
+    ok &= check("FIX 1: NO colour labels drawn on a raster source",
+                seen == set(), f"leaked codes: {sorted(seen)}")
     RESULTS.append(("colour labeling + unknown_colors", ok))
 
 
@@ -447,14 +505,176 @@ def t_banderoll():
 
 
 def t_alpha_png():
-    hdr("STEP 6 — PNG with an alpha channel")
+    hdr("STEP 6 — FIX 2: PNG transparency flattened onto PINK_PAD, not white")
+    ok = True
+    pink255 = tuple(round(v * 255) for v in
+                    (slicer.PINK_PAD_R, slicer.PINK_PAD_G, slicer.PINK_PAD_B))
+
+    # 1. The conversion itself: a transparent region must come out PINK_PAD.
     p = make_alpha_png(os.path.join(OUT, "src_alpha.png"), 600, 1200)
-    res = t_full_pipeline(p, "png_alpha", 6.0, 12.0)
-    c = sample_rgb(res["strips"][3]["bytes"], 0, 0.5, 0.5)
-    print(f"    colour rendered where the PNG was transparent: {c}")
-    ok = check("transparent region does not crash the pipeline", len(res["strips"]) == 4)
-    RESULTS.append(("alpha PNG", ok))
-    return c
+    with open(p, "rb") as f:
+        raw = f.read()
+    src_pix = fitz.Pixmap(raw)
+    ok &= check("test PNG genuinely carries an alpha channel", bool(src_pix.alpha),
+                f"alpha={src_pix.alpha} n={src_pix.n}")
+    conv = image_to_pdf(raw, 6.0, 12.0)
+    c = sample_rgb(conv, 0, 0.5, 0.05)     # inside the transparent leftover
+    print(f"    transparent region renders as {c}; PINK_PAD is {pink255}")
+    ok &= check("transparency flattened to PINK_PAD (not white)",
+                all(abs(a - b) <= 2 for a, b in zip(c, pink255)), f"got {c}")
+
+    # 2. The mechanical payoff, verified rather than assumed: that colour must be
+    #    classified as BACKGROUND by the very mask the Klipp scan uses.
+    arr = np.array([[list(c)]], dtype=np.int32)
+    bg = slicer._background_mask(arr, {})
+    ok &= check("flattened pink is read as background by _background_mask "
+                "(even with an EMPTY colour_map)", bool(bg[0, 0]), f"mask={bg[0,0]}")
+
+    # 3. End-to-end: the transparent design and a control that PAINTS the same
+    #    pink must produce identical Klipp decisions. If flattening did not put
+    #    transparency into the background class, the transparent version would
+    #    read as content to the page edge and its Klipp marking would vanish.
+    ctrl = make_alpha_png(os.path.join(OUT, "src_alpha_control.png"), 600, 1200,
+                          opaque_bg="#F490B5")
+    r_alpha = t_full_pipeline(p, "png_alpha", 6.0, 12.0)
+    r_ctrl = t_full_pipeline(ctrl, "png_alpha_control", 6.0, 12.0)
+
+    def klipp_map(res):
+        out = []
+        for s in res["strips"]:
+            for i, words in enumerate(page_texts(s["bytes"])):
+                if "Klipp" in words:
+                    out.append((s["filename"], i + 1, has_dashed_line(s["bytes"], i)))
+        return out
+
+    ka, kc = klipp_map(r_alpha), klipp_map(r_ctrl)
+    print(f"    Klipp on transparent-flattened : {ka}")
+    print(f"    Klipp on painted-pink control  : {kc}")
+    ok &= check("FIX 2: Klipp fires on the transparent design at all", len(ka) > 0,
+                "no Klipp — flattening did not reach the content scan")
+    ok &= check("FIX 2: transparent-flattened Klipp == painted-pink control",
+                ka == kc, f"{ka} vs {kc}")
+
+    # 4. Rendered-pixel comparison of the converted page against the control.
+    #    NOT an identity assertion: a transparency edge anti-aliases where a
+    #    painted edge does not, so the two differ on the image's 1-px border ring
+    #    and on the single row where transparency meets artwork. That is exactly
+    #    the partial-coverage artifact class _find_cut_boundary and
+    #    is_fully_background already trim before deciding anything, which is why
+    #    the Klipp decisions above come out identical regardless. Assert the
+    #    difference is confined to those places rather than pretending it is zero.
+    def conv_px(path):
+        with open(path, "rb") as f:
+            d = fitz.open(stream=image_to_pdf(f.read(), 6.0, 12.0), filetype="pdf")
+        q = d[0].get_pixmap(matrix=fitz.Matrix(3, 3), colorspace=fitz.csRGB)
+        a = np.frombuffer(q.samples, dtype=np.uint8).reshape(q.height, q.width, q.n)[:, :, :3].astype(int)
+        d.close()
+        return a
+
+    A, C = conv_px(p), conv_px(ctrl)
+    dif = np.abs(A - C).max(axis=2) > 0
+    h, w = dif.shape
+    interior = dif.copy()
+    interior[0, :] = interior[-1, :] = False        # the border ring the pipeline trims
+    interior[:, 0] = interior[:, -1] = False
+    bad_rows = np.flatnonzero(interior.any(axis=1))
+    print(f"    differing pixels: {int(dif.sum())} of {dif.size} "
+          f"({100*dif.sum()/dif.size:.3f}%); interior differing rows: {bad_rows.tolist()}")
+    ok &= check("differences confined to the border ring + one transparency-edge row",
+                dif.sum() / dif.size < 0.005 and len(bad_rows) <= 2,
+                f"{int(dif.sum())} px, {len(bad_rows)} interior rows")
+
+    # 5. Trailing-page exclusion must also see transparency as background.
+    counts_a = [len(page_dims(s["bytes"])) for s in r_alpha["strips"]]
+    counts_c = [len(page_dims(s["bytes"])) for s in r_ctrl["strips"]]
+    print(f"    pages/strip transparent={counts_a} painted-pink control={counts_c}")
+    ok &= check("page-exclusion decisions match the painted-pink control",
+                counts_a == counts_c, f"{counts_a} vs {counts_c}")
+    RESULTS.append(("FIX 2 alpha -> PINK_PAD + Klipp boundary benefit", ok))
+
+
+def t_jpg_has_no_alpha():
+    hdr("STEP 6b — JPG has no alpha channel (Fix 2 is PNG-only)")
+    ok = True
+    jpg = os.path.join(OUT, "src_design.jpg")
+    with open(jpg, "rb") as f:
+        raw = f.read()
+    pix = fitz.Pixmap(raw)
+    print(f"    JPG pixmap: alpha={pix.alpha} n={pix.n} colorspace={pix.colorspace}")
+    ok &= check("JPG carries no alpha channel — nothing to flatten",
+                not pix.alpha and pix.n == 3, f"alpha={pix.alpha} n={pix.n}")
+
+    # The PINK_PAD underlay must therefore be completely invisible on a JPG: an
+    # opaque image covers it. Compare against a page built with no underlay.
+    conv = image_to_pdf(raw, 6.0, 12.0)
+    bare = fitz.open()
+    bp = bare.new_page(width=6.0 * PTS_PER_M, height=12.0 * PTS_PER_M)
+    bp.insert_image(bp.rect, stream=raw, keep_proportion=False)
+    bb = io.BytesIO()
+    bare.save(bb)
+    bare.close()
+
+    def dg(pdf_bytes):
+        d = fitz.open(stream=pdf_bytes, filetype="pdf")
+        h = hashlib.sha256()
+        for pg in d:
+            h.update(pg.get_pixmap(matrix=fitz.Matrix(2, 2), colorspace=fitz.csRGB).samples)
+        d.close()
+        return h.hexdigest()
+
+    ok &= check("underlay is a visual no-op for an opaque JPG",
+                dg(conv) == dg(bb.getvalue()))
+    RESULTS.append(("JPG has no alpha; underlay is a no-op", ok))
+
+
+def t_fix1_raster_never_labels():
+    hdr("STEP 6c — FIX 1: raster never labels, under every flag combination")
+    ok = True
+    jpg = os.path.join(OUT, "src_design.jpg")
+    with open(jpg, "rb") as f:
+        raster = f.read()
+    codes = set(v for v in COLOUR_MAP.values() if v != "Skip")
+
+    for kw in ({}, {"skip_colors": False}, {"ruta_nedre": True},
+               {"banderoll": True}):
+        res = run_slice(raster, 6.0, 12.0, colour_map=COLOUR_MAP, **kw)
+        seen = set()
+        for s in res["strips"]:
+            for words in page_texts(s["bytes"]):
+                seen |= (set(words) & codes)
+        ok &= check(f"raster {kw or 'default'}: no labels, colors_analyzed=False",
+                    seen == set() and res["colors_analyzed"] is False,
+                    f"codes={sorted(seen)} colors_analyzed={res['colors_analyzed']}")
+
+    # Control: the gate must NOT have broken labeling for vector sources.
+    vec = fitz.open()
+    vp = vec.new_page(width=6.0 * PTS_PER_M, height=12.0 * PTS_PER_M)
+    vs = vp.new_shape()
+    vs.draw_rect(fitz.Rect(0, 0, vp.rect.width, vp.rect.height * 0.3))
+    vs.finish(fill=_hexf(PINK_SKIP), color=None)
+    vs.draw_rect(fitz.Rect(0, vp.rect.height * 0.3, vp.rect.width, vp.rect.height))
+    vs.finish(fill=_hexf("#1E7534"), color=None)
+    vs.commit()
+    vb = io.BytesIO()
+    vec.save(vb)
+    vec.close()
+    vres = run_slice(vb.getvalue(), 6.0, 12.0, colour_map=COLOUR_MAP)
+    vseen = set()
+    for s in vres["strips"]:
+        for words in page_texts(s["bytes"]):
+            vseen |= (set(words) & codes)
+    print(f"    vector control still labels: {sorted(vseen)} "
+          f"colors_analyzed={vres['colors_analyzed']}")
+    ok &= check("vector sources STILL get labels (gate is raster-only)",
+                vseen == {"3560"} and vres["colors_analyzed"] is True,
+                f"codes={sorted(vseen)}")
+
+    # No mixed vector/raster job is possible: the conversion always yields ONE page.
+    n = fitz.open(stream=image_to_pdf(raster, 6.0, 12.0), filetype="pdf")
+    ok &= check("image_to_pdf yields exactly 1 page — no mixed-source job exists",
+                len(n) == 1, f"{len(n)} pages")
+    n.close()
+    RESULTS.append(("FIX 1 raster never labels", ok))
 
 
 def t_trailing_bg_exclusion():
@@ -539,6 +759,8 @@ def main():
     t_png_mismatched_end_to_end(mismatched)
     t_banderoll()
     t_alpha_png()
+    t_jpg_has_no_alpha()
+    t_fix1_raster_never_labels()
     t_trailing_bg_exclusion()
     t_jpeg_robustness()
     t_resolution_probe()

@@ -66,12 +66,12 @@ Unknown colours are left unlabeled **individually**; they do not suppress labeli
 
 ### Raster sources
 
-A JPG or PNG is detected by magic bytes and converted to a single-page PDF before anything else runs, sized `width_m × height_m` at 28.3465 pts/m — the same 1:100 scale every vector design in this pipeline is drawn at, which is what keeps the absolute-point Klipp and label thresholds meaning the same physical distance. Everything downstream (banderoll rotation, slicing, Klipp detection, colour labeling, page numbering, grid) is the ordinary vector path, unchanged.
+A JPG or PNG is detected by magic bytes and converted to a single-page PDF before anything else runs, sized `width_m × height_m` at 28.3465 pts/m — the same 1:100 scale every vector design in this pipeline is drawn at, which is what keeps the absolute-point Klipp and label thresholds meaning the same physical distance. Everything downstream (banderoll rotation, slicing, Klipp detection, page numbering, grid) is the ordinary vector path, unchanged — with one deliberate exception, colour labeling, which is forced off for raster sources.
 
 - **The image is stretched, not fitted.** The entered dimensions win; a mismatched pixel aspect is distorted to fill them. No letterboxing, no rejection.
-- **Colour labels still work.** The labeler is pixel-based and reads the rendered strip page, so it labels raster artwork exactly as it labels vector artwork.
+- **Colour labels are never drawn on a raster source.** Forced off regardless of `skip_colors`. Colour labeling describes the discrete paints a *vector* design was drawn with; raster pixels can drift into a mapped colour's tolerance band by accident (resampling, JPEG ringing, photographic gradients). Note the labeler is pixel-based and reads the rendered page, so it does *not* opt out on its own — this is an explicit gate in `run_slice()`. `colors_analyzed` is correspondingly `false`.
 - **Klipp needs a declared `"Skip"` background.** A raster design that paints its leftover fabric in a mapped `"Skip"` colour gets a cut line as normal. A full-bleed photo with no background region gets **no** Klipp marking — correct, since there is no leftover fabric to cut.
-- **PNG transparency renders as white**, and `#FFFFFF` is a real paint code (`Vit`). Flatten transparent areas onto the intended background before upload, or they will be labeled as white paint.
+- **PNG transparency is flattened onto `PINK_PAD`** (`#F490B5`), the same pink the slicer uses to pad partial pages — not white. That colour falls inside the background detector's pink band, so transparent regions are correctly read as "not real content" by the Klipp content-boundary scan and by trailing-page exclusion. JPG has no alpha channel and is unaffected.
 
 **Example with curl:**
 
