@@ -9,6 +9,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+ACCEPTED_EXTENSIONS = ('.pdf', '.jpg', '.jpeg', '.png')
+
 
 def parse_bool(value) -> bool:
     """Safely parse boolean from FormData string values."""
@@ -29,8 +31,13 @@ async def slice_pdf(
     ruta_nedre: str = Form('false'),
     colour_map: str = Form('')
 ):
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(400, "Only PDF files are accepted")
+    # Raster uploads are converted to a single-page PDF inside run_slice (see
+    # slicer.image_to_pdf); the actual format decision there sniffs magic bytes.
+    # This extension check stays as the friendly front door — a wrong file type
+    # fails here with a clear 400 instead of deep inside pymupdf.
+    if not file.filename.lower().endswith(ACCEPTED_EXTENSIONS):
+        raise HTTPException(
+            400, f"Only {', '.join(ACCEPTED_EXTENSIONS)} files are accepted")
 
     banderoll_bool = parse_bool(banderoll)
     skip_colors_bool = parse_bool(skip_colors)
@@ -80,8 +87,18 @@ async def slice_pdf(
             f"tolerance; these are left UNLABELED (all mapped colors still "
             f"labeled): {', '.join(unknown)}"
         )
-    else:
+    elif result["colors_analyzed"]:
         logger.info("All design colors matched a colour_map entry.")
+    else:
+        # Do NOT claim a clean bill of health here. unknown_colors is [] because
+        # the check never ran — a raster upload has no vector fills for
+        # extract_pdf_colors to read (labels are still drawn; they are placed from
+        # rendered pixels). Unmapped colours in a raster design ship UNLABELED and
+        # silently, so say that instead of "all colors matched".
+        logger.info(
+            "Unknown-color detection did not run (raster source or skip_colors); "
+            "unknown_colors=[] means NOT CHECKED, not 'all colors matched'."
+        )
 
     return {
         "strips": [
@@ -92,7 +109,8 @@ async def slice_pdf(
             for s in result["strips"]
         ],
         "grid_pdf": base64.b64encode(result["grid_pdf"]).decode(),
-        "unknown_colors": result["unknown_colors"]
+        "unknown_colors": result["unknown_colors"],
+        "colors_analyzed": result["colors_analyzed"]
     }
 
 
