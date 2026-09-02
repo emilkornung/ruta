@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0 — 2026-09-02
+
+**JPG/PNG uploads are now accepted alongside PDF (Railway side only; the tifo-databas upload form is a separate follow-up).**
+
+- **New preprocessing step: `slicer.image_to_pdf()`.** A raster upload (detected by magic bytes via `is_raster_source()`, not by filename) is wrapped in a single-page PDF sized `width_m × height_m` at the new `PTS_PER_M` constant, with the image **stretched** to fill the page (`keep_proportion=False`). The entered dimensions win; a mismatched pixel aspect is distorted to match rather than letterboxed or rejected.
+- **`PTS_PER_M = 72/2.54` (28.3465 pts/m) is not an arbitrary choice.** Nothing in `slicer.py` ever declared a pts-per-metre — it is derived as `full_w / width_m` from whatever page the source carries. Every real design is drawn at 1:100, so that derivation lands on 28.3465 on every shipped file (measured across `pest övre`, `pest mitten`, `ENAD_rutor`). Since `KLIPP_MIN_PINK_PT`, `KLIPP_LINE_MARGIN_PT`, `MIN_LABEL_PATCH_SIZE_PT`, `LABEL_FONT_DEFAULT` and `PAGE_NUM_EXCL_*` are all absolute PDF-point values calibrated against that scale, a raster page built at any other size would silently change what every one of them means physically.
+- **Banderoll mode swaps the page dimensions before conversion**, so `rotate_pdf_90()` reconciles a raster source exactly as it does a landscape vector source.
+- **Everything downstream is unchanged and verified so, not assumed so.** Rotation (default *and* `ruta_nedre`), strip/page counts and dimensions, Klipp cut detection, TIF-68 trailing-background exclusion, colour labeling and page numbering were each exercised on real JPG and PNG input through the real `run_slice()` entry point — see the new `_validate_raster_source.py` (12/12 groups). The vector path is pixel-identical to 1.3.0 on `pest övre` in both rotation modes.
+
+### New field: `colors_analyzed`
+
+`run_slice()` and the `/slice` response gained a `colors_analyzed` boolean.
+
+Unknown-colour detection reads **vector** fills (`extract_pdf_colors` → `get_drawings`). A raster source has none, so it always returned `unknown_colors: []` — not because every colour matched, but because nothing was examined. Verified directly: the same two-colour design with one unmapped colour reports `['#FF00FF']` as a PDF and `[]` as a PNG. `api.py` then logged *"All design colors matched a colour_map entry."*, a false clean bill of health, and exactly the silent-unlabeled-shipping failure TIF-60 was raised for.
+
+`[]` remains the right value (listing every distinct pixel value on a photo would be thousands of useless entries), but callers can now distinguish *nothing unknown* from *not checked*. `api.py` logs the distinction instead of claiming a match. **Consumers must not present an empty `unknown_colors` as "all colours matched" when `colors_analyzed` is `false`.**
+
+> Raster designs therefore ship unmapped colours unlabeled with no per-colour warning. Whether raster uploads should get real unknown-colour detection (by sampling rendered pixels) is a product decision deferred to the tifo-databas follow-up — it depends on whether uploads will be flat-colour design exports or photographs.
+
 ## 1.3.0 — 2026-07-11
 
 **Fixes the colour-map wipe that shipped `pest mitten 24x31,5m` (ruta_jobs `5ac70b43`) with zero labels (TIF-60, Urgent).**

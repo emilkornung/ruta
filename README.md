@@ -4,9 +4,10 @@ FastAPI microservice that slices tifo PDF designs into 1.5 m-wide vertical strip
 
 ## What it does
 
-Accepts a PDF upload together with the physical dimensions (width × height in metres) and returns the PDF split into numbered strip files, each page rotated 90° to landscape. Handles:
+Accepts a PDF, JPG or PNG upload together with the physical dimensions (width × height in metres) and returns the design split into numbered strip files, each page rotated 90° to landscape. Handles:
 
 - Arbitrary strip count calculated from `ceil(width / 1.5)`
+- Raster (JPG/PNG) sources, converted to a single-page PDF up front and **stretched** to the entered dimensions
 - Bottom-to-top page ordering within each strip
 - Pink partial-page padding with a dotted cut line and "Klipp" label
 - Banderoll mode: rotates a landscape source PDF 90° before slicing
@@ -34,7 +35,7 @@ Multipart form upload. Parameters:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `file` | PDF file | yes | The source PDF to slice |
+| `file` | PDF / JPG / PNG | yes | The source design to slice. A raster upload is converted to a single-page PDF first (see [Raster sources](#raster-sources)) |
 | `width_m` | float | yes | Total design width in metres (e.g. `63.0`) |
 | `height_m` | float | yes | Total design height in metres (e.g. `20.0`) |
 | `banderoll` | bool | no | `true` if the PDF is landscape and should be rotated 90° first (default `false`) |
@@ -52,13 +53,25 @@ Response (JSON):
       "data": "<base64-encoded PDF bytes>"
     }
   ],
-  "unknown_colors": ["#RRGGBB"]
+  "unknown_colors": ["#RRGGBB"],
+  "colors_analyzed": true
 }
 ```
 
 `unknown_colors` lists the design colours that **no** `colour_map` entry claims — i.e. whose nearest mapped colour is further away than `COLOR_MATCH_TOLERANCE`. It is empty when colour labeling is skipped or every colour matches an entry.
 
 Unknown colours are left unlabeled **individually**; they do not suppress labeling of the colours that *are* mapped (TIF-60 — before 1.3.0 a single unknown colour wiped the whole map and the strips shipped with no labels at all). A `"Skip"` entry counts as claiming its colour: known, deliberately unlabeled, never reported as unknown.
+
+`colors_analyzed` (added 1.4.0) says whether that check actually **ran**. It is `false` for `skip_colors=true` and for every raster upload — unknown-colour detection reads vector fills, and a JPG/PNG has none. When it is `false`, an empty `unknown_colors` means *not checked*, **not** "every colour matched"; do not present it to the user as a clean bill of health.
+
+### Raster sources
+
+A JPG or PNG is detected by magic bytes and converted to a single-page PDF before anything else runs, sized `width_m × height_m` at 28.3465 pts/m — the same 1:100 scale every vector design in this pipeline is drawn at, which is what keeps the absolute-point Klipp and label thresholds meaning the same physical distance. Everything downstream (banderoll rotation, slicing, Klipp detection, colour labeling, page numbering, grid) is the ordinary vector path, unchanged.
+
+- **The image is stretched, not fitted.** The entered dimensions win; a mismatched pixel aspect is distorted to fill them. No letterboxing, no rejection.
+- **Colour labels still work.** The labeler is pixel-based and reads the rendered strip page, so it labels raster artwork exactly as it labels vector artwork.
+- **Klipp needs a declared `"Skip"` background.** A raster design that paints its leftover fabric in a mapped `"Skip"` colour gets a cut line as normal. A full-bleed photo with no background region gets **no** Klipp marking — correct, since there is no leftover fabric to cut.
+- **PNG transparency renders as white**, and `#FFFFFF` is a real paint code (`Vit`). Flatten transparent areas onto the intended background before upload, or they will be labeled as white paint.
 
 **Example with curl:**
 

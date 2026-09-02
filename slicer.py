@@ -20,7 +20,28 @@ STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
 SLICE_WORKERS = 6
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
+
+# Page scale for raster (JPG/PNG) sources — see image_to_pdf().
+#
+# Nothing in this module ever declares a pts-per-metre; slice_one_strip and
+# generate_grid_pdf both DERIVE it as `full_w / width_m` from whatever page the
+# source PDF happens to carry. Every real design we ship is drawn at 1:100 — one
+# centimetre of page per metre of fabric — so that derivation lands on 72/2.54 =
+# 28.3465 pts/m every time (measured: pest övre 28.3467/28.3463, pest mitten
+# 28.3463/28.3492, ENAD_rutor 28.3465/28.3465).
+#
+# A raster upload carries no page size of its own, so the preprocessing step has
+# to pick one, and it MUST pick this one. Every Klipp and label threshold in this
+# module — KLIPP_MIN_PINK_PT, KLIPP_LINE_MARGIN_PT, MIN_LABEL_PATCH_SIZE_PT,
+# LABEL_FONT_DEFAULT, PAGE_NUM_EXCL_* — is an absolute PDF-point value calibrated
+# against that scale. Choose any other page size and all of them silently come to
+# mean a different physical distance on the fabric.
+#
+# 72 pts/inch / 2.54 cm/inch is pts per CENTIMETRE, and one centimetre of page IS
+# one metre of fabric — so the 1:100 reduction is already carried by that ratio
+# and must NOT be applied a second time.
+PTS_PER_M = 72.0 / 2.54           # 28.3465 pts/m (1 m fabric = 1 cm page)
 
 # Pink page detection
 PINK_THRESHOLD         = 0.85
@@ -218,6 +239,49 @@ def is_fully_background(src_doc, src_page_num, clip):
     if bg.shape[0] >= 3 and bg.shape[1] >= 3:
         bg = bg[1:-1, 1:-1]
     return bool(bg.mean() > FULLY_BG_THRESHOLD)
+
+
+# ── Raster source preprocessing ───────────────────────────────────────────────
+
+# Magic bytes, not the filename extension: run_slice() receives raw bytes with no
+# name attached, and sniffing the content is the only check that is true at the
+# point the decision is actually made. api.py still screens extensions so a
+# mislabelled upload fails with a clear 400 rather than deep inside pymupdf.
+_JPEG_MAGIC = b"\xff\xd8\xff"
+_PNG_MAGIC  = b"\x89PNG\r\n\x1a\n"
+
+
+def is_raster_source(data):
+    """True if `data` looks like a JPG or PNG rather than a PDF."""
+    return data.startswith(_JPEG_MAGIC) or data.startswith(_PNG_MAGIC)
+
+
+def image_to_pdf(img_bytes, width_m, height_m):
+    """
+    Wrap a JPG/PNG into a single-page PDF sized width_m x height_m at PTS_PER_M,
+    with the image STRETCHED to fill that page exactly.
+
+    This is the whole of raster support: once the image is a normally-scaled
+    single-page PDF, every stage after it — banderoll rotation, strip slicing,
+    the Klipp content scan, colour labeling, page numbering, the grid — runs
+    unchanged, because none of them ever ask whether the page's marks came from
+    vectors or from an embedded image.
+
+    Aspect ratio is deliberately NOT preserved (keep_proportion=False). The
+    entered dimensions are the truth about the physical tifo; an upload whose
+    pixel aspect disagrees is stretched to match rather than letterboxed or
+    rejected. Letterboxing would paint bands of blank page that the content scan
+    and the labeler would then both have to reason about, and rejecting would put
+    a pixel-exact demand on the upload form that nobody can meet.
+    """
+    out  = fitz.open()
+    page = out.new_page(width=width_m * PTS_PER_M, height=height_m * PTS_PER_M)
+    page.insert_image(page.rect, stream=img_bytes, keep_proportion=False)
+
+    buf = io.BytesIO()
+    out.save(buf)
+    out.close()
+    return buf.getvalue()
 
 
 def rotate_pdf_90(pdf_bytes, clockwise=True):
@@ -1100,6 +1164,11 @@ def run_slice(
     """
     Slices a PDF into 1.5m-wide vertical strips.
 
+    Accepts a JPG or PNG in place of a PDF (sniffed from the bytes, see
+    is_raster_source). A raster upload is converted to a single-page PDF first —
+    stretched to fill a page sized from width_m/height_m at PTS_PER_M — after
+    which every stage below is the ordinary vector path, unchanged.
+
     colour_map is a {hex: ncs_code} dict sourced from Supabase and passed in by
     the caller (api.py). It replaces the retired local color_map.json.
 
@@ -1120,9 +1189,29 @@ def run_slice(
             {"filename": "strip-01.pdf", "bytes": b"..."},
             ...
         ],
-        "unknown_colors": ["#RRGGBB", ...]  # empty if skip_colors=True or no unknowns
+        "unknown_colors": ["#RRGGBB", ...],  # empty if skip_colors=True or no unknowns
+        "colors_analyzed": bool,             # False when unknown_colors was never
+                                             # computed (skip_colors, or a raster
+                                             # source, which has no vector fills to
+                                             # inspect) — so [] is not misread as
+                                             # "every colour matched"
     }
     """
+    # Raster preprocessing runs FIRST, so every stage below — banderoll rotation
+    # included — sees an ordinary single-page PDF and needs no raster awareness.
+    #
+    # The banderoll swap: in banderoll mode the caller's width/height describe the
+    # design as HUNG (portrait), while the artwork is laid out landscape and
+    # rotate_pdf_90 below reconciles the two. A raster upload is laid out the same
+    # landscape way, so the page is built in that same pre-rotation orientation —
+    # dimensions swapped — and the existing rotation then fixes it up exactly as it
+    # does for a vector source. Building it portrait instead would hand
+    # rotate_pdf_90 an already-correct page and leave it transposed.
+    raster_source = is_raster_source(pdf_bytes)
+    if raster_source:
+        pdf_bytes = (image_to_pdf(pdf_bytes, height_m, width_m) if banderoll
+                     else image_to_pdf(pdf_bytes, width_m, height_m))
+
     if banderoll:
         pdf_bytes = rotate_pdf_90(pdf_bytes)
 
@@ -1139,7 +1228,21 @@ def run_slice(
     # detection, blind to any design whose background is a different Skip colour.
     color_map = colour_map or {}
 
-    if not effective_skip:
+    # Unknown-colour detection reads VECTOR fills (extract_pdf_colors ->
+    # get_drawings). A raster source has no drawings at all, so it always yields
+    # the empty set and unknown_colors comes back [] — not because every colour
+    # matched, but because nothing was examined. Verified: the same two-colour
+    # design with one unmapped colour reports ['#FF00FF'] as a PDF and [] as a PNG.
+    #
+    # [] is the right value to return (the alternative, reporting every distinct
+    # pixel value, would be thousands of useless entries on a photo), but callers
+    # must be able to tell "nothing unknown" from "not checked" — otherwise they
+    # report a clean bill of health for a design that may well ship unlabeled
+    # patches, which is exactly the silent failure TIF-60 was raised for. Hence
+    # this flag, decided here rather than re-derived by each caller.
+    colors_analyzed = not effective_skip and not raster_source
+
+    if colors_analyzed:
         hex_colors = extract_pdf_colors(pdf_bytes)
         # TIF-60: unknown colors are REPORTED, never a reason to discard the map.
         # The old code set color_map = {} whenever any unknown was found, so a
@@ -1159,4 +1262,5 @@ def run_slice(
 
     grid_bytes = generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=ruta_nedre)
 
-    return {"strips": strips, "unknown_colors": unknown_colors, "grid_pdf": grid_bytes}
+    return {"strips": strips, "unknown_colors": unknown_colors,
+            "grid_pdf": grid_bytes, "colors_analyzed": colors_analyzed}
