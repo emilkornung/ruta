@@ -36,6 +36,47 @@ PNG_SCALE = 8.0
 OUT_DIR   = "validation"
 
 
+def count_labelable_patches(arr, color_map):
+    """
+    Independently recount the connected patches on a rendered page, split by the
+    TIF-69 size gate. This is the SINGLE definition of the "zero skips" contract,
+    shared by run_design() here and by _validate_color_labels.py — before TIF-71
+    that second guard had its own copy that never learned about the size gate and
+    silently failed from the TIF-69 merge onward.
+
+    `arr` must be (H, W, 3) int, rendered at slicer.LABEL_RENDER_SCALE (the scale
+    the labeler itself analyses at). Returns two {code: n} dicts:
+
+      expected       -- patches >= MIN_PATCH_PX whose inscribed-circle radius is
+                        >= MIN_LABEL_PATCH_SIZE_PT. Every one of these MUST get
+                        exactly one label.
+      skipped_small  -- patches >= MIN_PATCH_PX but below that radius floor.
+                        Expected to be skipped (TIF-69) — reported, never
+                        asserted on.
+
+    Uses the labeler's own nearest-colour per-code masks (slicer._code_masks) and
+    the same distance-transform inscribed-circle metric (r_pts) its sizing ladder
+    uses, so the recount cannot drift from what the labeler actually does.
+    """
+    S = slicer.LABEL_RENDER_SCALE
+    expected, skipped_small = {}, {}
+    for code, mask in slicer._code_masks(arr, color_map).items():
+        lbl, num = ndimage.label(mask)
+        if num == 0:
+            continue
+        counts  = np.bincount(lbl.ravel())
+        objects = ndimage.find_objects(lbl)
+        for comp in range(1, num + 1):
+            if counts[comp] < slicer.MIN_PATCH_PX:
+                continue
+            sub_mask = lbl[objects[comp - 1]] == comp
+            dt = ndimage.distance_transform_edt(np.pad(sub_mask, 1))[1:-1, 1:-1]
+            r_pts = float(dt.max()) / S
+            bucket = skipped_small if r_pts < slicer.MIN_LABEL_PATCH_SIZE_PT else expected
+            bucket[code] = bucket.get(code, 0) + 1
+    return expected, skipped_small
+
+
 def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
                pdf_strips=(), ruta_nedre=False, out_dir=OUT_DIR):
     num_strips = math.ceil(width_m / slicer.STRIP_WIDTH_M)
@@ -63,11 +104,10 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
 
     def recording_label(page, color_map):
         nonlocal expected_total, placed_total, skipped_small_total
-        # Independent recount of labelable patches on the clean page (before
-        # any text lands on it) — this is what "zero skips" is checked against.
-        # Uses the same nearest-color / per-code mask semantics as the labeler,
-        # AND the same distance-transform inscribed-circle metric (r_pts) the
-        # labeler's own sizing ladder uses, split by the TIF-69 size gate:
+        # Independent recount of labelable patches on the clean page (before any
+        # text lands on it) — this is what "zero skips" is checked against. The
+        # logic lives in count_labelable_patches() so this harness and
+        # _validate_color_labels.py share one definition of the TIF-69 contract:
         #   expected_total       -- patches at/above MIN_LABEL_PATCH_SIZE_PT.
         #                           These must all get labeled (checked below).
         #   skipped_small_total  -- patches below it. Expected to be skipped —
@@ -75,23 +115,9 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
         pix = page.get_pixmap(matrix=fitz.Matrix(S, S), colorspace=fitz.csRGB)
         arr = np.frombuffer(pix.samples, dtype=np.uint8) \
                 .reshape(pix.height, pix.width, pix.n)[:, :, :3].astype(np.int32)
-        for code, mask in slicer._code_masks(arr, color_map).items():
-            lbl, num = ndimage.label(mask)
-            if num == 0:
-                continue
-            counts  = np.bincount(lbl.ravel())
-            objects = ndimage.find_objects(lbl)
-            for comp in range(1, num + 1):
-                if counts[comp] < slicer.MIN_PATCH_PX:
-                    continue
-                sl       = objects[comp - 1]
-                sub_mask = lbl[sl] == comp
-                dt = ndimage.distance_transform_edt(np.pad(sub_mask, 1))[1:-1, 1:-1]
-                r_pts = float(dt.max()) / S
-                if r_pts < slicer.MIN_LABEL_PATCH_SIZE_PT:
-                    skipped_small_total += 1
-                else:
-                    expected_total += 1
+        exp_by_code, skip_by_code = count_labelable_patches(arr, color_map)
+        expected_total      += sum(exp_by_code.values())
+        skipped_small_total += sum(skip_by_code.values())
 
         summary = real_label(page, color_map)
         for code, e in summary.items():
