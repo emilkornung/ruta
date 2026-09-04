@@ -7,7 +7,7 @@ Run:  python _validate_color_labels.py
 
 Validates on 'strip-15 test.pdf', page index 1:
   1. ZERO SKIPS: every patch >= MIN_PATCH_PX of the 5 non-skip colors gets
-     exactly one label (round-3 contract — no legibility floor).
+     exactly one label (no legibility floor).
   2. No labels land on tiny noise fragments (< MIN_PATCH_PX).
   3. Every FITTED label's glyph bbox lies inside its own color's mask; sub-
      pixel labels are checked at their center pixel. "Forced" placements
@@ -41,13 +41,18 @@ def rgb(hexc):
     return np.array([int(h[i:i + 2], 16) for i in (0, 2, 4)], dtype=np.int32)
 
 
-# ── 1. Tolerance bands must be mutually disjoint ────────────────────────────────
+# ── 1. Pairwise colour separation (diagnostic, not a requirement) ───────────────
+# Since the round-4 nearest-argmin rework, _code_masks assigns each pixel to its
+# NEAREST mapped colour, so overlapping tolerance bands are resolved rather than
+# ambiguous — disjointness is no longer required for correctness. Reported here
+# only as tuning signal for COLOR_MATCH_TOLERANCE; the pass/fail expression below
+# deliberately excludes it.
 non_skip = [(h, c) for h, c in DUMMY_MAP.items() if c != "Skip"]
 print(f"Constants: TOLERANCE={slicer.COLOR_MATCH_TOLERANCE} "
       f"MIN_PATCH_PX={slicer.MIN_PATCH_PX} SCALE={slicer.LABEL_RENDER_SCALE} "
       f"DEFAULT={slicer.LABEL_FONT_DEFAULT} TECH_MIN={slicer.LABEL_FONT_TECH_MIN}")
-print("\nPairwise color distances (must exceed 2*tol = "
-      f"{2 * slicer.COLOR_MATCH_TOLERANCE} for unambiguous bands):")
+print("\nPairwise color distances (2*tol = "
+      f"{2 * slicer.COLOR_MATCH_TOLERANCE} is where bands would start to overlap):")
 min_pair = 1e9
 for i in range(len(non_skip)):
     for j in range(i + 1, len(non_skip)):
