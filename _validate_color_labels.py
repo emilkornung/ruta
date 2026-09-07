@@ -6,8 +6,11 @@ straight into slicer._label_colors_on_page.
 Run:  python _validate_color_labels.py
 
 Validates on 'strip-15 test.pdf', page index 1:
-  1. ZERO SKIPS: every patch >= MIN_PATCH_PX of the 5 non-skip colors gets
-     exactly one label (no legibility floor).
+  1. ZERO SKIPS: every patch that is >= MIN_PATCH_PX AND whose inscribed-circle
+     radius is >= MIN_LABEL_PATCH_SIZE_PT (the TIF-69 size gate) gets exactly one
+     label. Patches below that radius floor are expected to be skipped and are
+     reported, not asserted on. Counting is shared with _design_label_harness
+     (count_labelable_patches) so it stays in lockstep with run_guards.py.
   2. No labels land on tiny noise fragments (< MIN_PATCH_PX).
   3. Every FITTED label's glyph bbox lies inside its own color's mask; sub-
      pixel labels are checked at their center pixel. "Forced" placements
@@ -17,9 +20,9 @@ Validates on 'strip-15 test.pdf', page index 1:
 """
 import numpy as np
 import fitz
-from scipy import ndimage
 
 import slicer
+from _design_label_harness import count_labelable_patches
 
 PDF        = "strip-15 test.pdf"
 PAGE_INDEX = 1
@@ -83,20 +86,27 @@ arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 
 arr = arr[:, :, :3].astype(np.int32)
 tol_sq = slicer.COLOR_MATCH_TOLERANCE ** 2
 
-# 3a. Zero skips: every real patch gets exactly one label. Recount uses the
-# same nearest-color / per-code mask semantics as the labeler.
+# 3a. Zero skips: every patch at/above the TIF-69 size floor gets exactly one
+# label. The recount is delegated to _design_label_harness.count_labelable_patches
+# — the SAME logic run_guards.py asserts against — so this guard cannot drift from
+# the contract again. It did, silently: it counted every patch >= MIN_PATCH_PX and
+# ignored MIN_LABEL_PATCH_SIZE_PT, so it failed on every design from the TIF-69
+# merge (2026-07-18) until this fix.
 code_masks = slicer._code_masks(arr, DUMMY_MAP)
+exp_by_code, skip_by_code = count_labelable_patches(arr, DUMMY_MAP)
 zero_skips = True
-print("\nExpected real patches (>= MIN_PATCH_PX) vs placed:")
+print(f"\nExpected real patches (>= MIN_PATCH_PX and >= "
+      f"{slicer.MIN_LABEL_PATCH_SIZE_PT}pt inscribed radius) vs placed:")
 for h, c in non_skip:
-    mask   = code_masks.get(c, np.zeros(arr.shape[:2], dtype=bool))
-    lbl, n = ndimage.label(mask)
-    counts = np.bincount(lbl.ravel())
-    exp    = int((counts[1:] >= slicer.MIN_PATCH_PX).sum())
-    got    = summary.get(c, {}).get("count", 0)
-    ok     = exp == got
+    exp   = exp_by_code.get(c, 0)
+    small = skip_by_code.get(c, 0)
+    got   = summary.get(c, {}).get("count", 0)
+    ok    = exp == got
     zero_skips &= ok
-    print(f"  {h} ({c}): expected {exp}, placed {got}  {'OK' if ok else 'MISMATCH'}")
+    note  = (f"   (+{small} sub-{slicer.MIN_LABEL_PATCH_SIZE_PT}pt skipped, expected)"
+             if small else "")
+    print(f"  {h} ({c}): expected {exp}, placed {got}  "
+          f"{'OK' if ok else 'MISMATCH'}{note}")
 
 # 3b. Fitted labels: glyph bbox inside the label's own code mask. For rects
 # smaller than the analysis pixel grid, the center pixel is the honest test.
