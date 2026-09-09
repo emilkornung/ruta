@@ -7,6 +7,7 @@ FastAPI microservice that slices tifo PDF designs into 1.5 m-wide vertical strip
 Accepts a PDF, JPG or PNG upload together with the physical dimensions (width × height in metres) and returns the design split into numbered strip files, each page rotated 90° to landscape. Handles:
 
 - Arbitrary strip count calculated from `ceil(width / 1.5)`
+- Configurable **Skissyta** page height per job (`page_height_m`, default `4.0`); strip width stays locked at 1.5 m
 - Raster (JPG/PNG) sources, converted to a single-page PDF up front and **stretched** to the entered dimensions
 - Bottom-to-top page ordering within each strip
 - Pink partial-page padding with a dotted cut line and "Klipp" label
@@ -42,6 +43,28 @@ Multipart form upload. Parameters:
 | `skip_colors` | bool | no | `true` to skip colour-label checking entirely (default `false`) |
 | `ruta_nedre` | bool | no | `true` for the lower half of a split (tudelat) motif (default `false`) |
 | `colour_map` | JSON string | no | Array of `{hex, ncs_code, tolerance}` sourced from the Supabase `colour_map` table. Collapsed to a `{hex: ncs_code}` dict. An `ncs_code` of `"Skip"` marks a colour as known-but-not-labeled. Per-entry `tolerance` is **not** consumed — matching uses the global `COLOR_MATCH_TOLERANCE`. |
+| `page_height_m` | float | no | Skissyta page height in metres — how tall **one printed ruta** is (default `4.0`, added 1.5.0). See [Skissyta](#skissyta). |
+
+## Skissyta
+
+The Skissyta is the size of one printed ruta. Its **width is locked at 1.5 m** (`slicer.STRIP_WIDTH_M`) because it is set by the fabric, not by the job; only the **height** is a per-job parameter.
+
+A common misreading is that a smaller Skissyta means a smaller scale, and that every point-valued constant therefore changes physical meaning. It does not. Nothing in `slicer.py` declares a pts-per-metre — it is *derived* as `full_w / width_m` from the **design**, which is drawn at 1:100, so it is 28.3465 pts/m at every Skissyta (measured across 1.0–8.0 m page heights). A shorter ruta is a **smaller page at the same scale**. Consequently:
+
+- **Fabric-referenced constants do not scale and must not be scaled.** `KLIPP_MIN_PINK_PT`, `KLIPP_LINE_MARGIN_PT`, `MIN_LABEL_PATCH_SIZE_PT`, `MIN_PATCH_PX`, `LABEL_FONT_DEFAULT` already mean a fixed distance on the fabric at any page height. Multiplying them by a Skissyta ratio is what would *break* their calibration.
+- **`COLOR_MATCH_TOLERANCE` does not scale either**, and not merely because it is not a length — see the comment on it in `slicer.py`.
+- **Page-furniture constants scale, but only for fit**, and only below `FURNITURE_FIT_FLOOR_M` (1.0 m) where they physically stop fitting on the page. See `slicer.furniture_scale()`. At the default 4.0 m — and every larger value — it returns exactly `1.0`, so default output is byte-identical to pre-1.5.0 releases *by construction*.
+
+Practical limits, technically derived (not from a known fabric or printing constraint):
+
+| Page height | Effect |
+|---|---|
+| < 0.48 m | the page-number exclusion zone is wider than the page |
+| < 0.66 m | a 2-digit page number overflows the page |
+| < ~0.97 m | "Klipp" cannot fit at any font size |
+| < ~2 m | `KLIPP_MIN_PINK_PT` (12 pt = 42 cm of blank fabric) exceeds 21% of the page, so cut markings become much rarer |
+
+The web app warns below 1.0 m and outside 2–8 m, and still submits — input is free by design.
 
 Response (JSON):
 

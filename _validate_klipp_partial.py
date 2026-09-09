@@ -148,7 +148,8 @@ def run():
         ns  = math.ceil(W / slicer.STRIP_WIDTH_M)
         npg = math.ceil(H / slicer.PAGE_HEIGHT_M)
         _, strip_bytes = slicer.slice_one_strip(
-            (strip, pdf_bytes, W, H, ns, npg, {}, nedre, True))
+            (strip, pdf_bytes, W, H, ns, npg, {}, nedre, True,
+             slicer.PAGE_HEIGHT_M))
         doc = fitz.open(stream=strip_bytes, filetype="pdf")
 
         # A page is "partial" iff the slicer drew the pink pad on it.

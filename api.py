@@ -2,7 +2,8 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 import base64
 import json
 import logging
-from slicer import run_slice, VERSION
+from slicer import (run_slice, VERSION, STRIP_WIDTH_M,
+                    PAGE_HEIGHT_M as DEFAULT_PAGE_HEIGHT_M)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,7 +30,12 @@ async def slice_pdf(
     banderoll: str = Form('false'),
     skip_colors: str = Form('false'),
     ruta_nedre: str = Form('false'),
-    colour_map: str = Form('')
+    colour_map: str = Form(''),
+    # TIF-87: the Skissyta's page height in metres — how tall one printed ruta
+    # is. OPTIONAL with the historical value as its default, so a client that
+    # does not send it behaves exactly as before. The strip WIDTH is not a
+    # parameter: it is fixed by the fabric (slicer.STRIP_WIDTH_M).
+    page_height_m: float = Form(DEFAULT_PAGE_HEIGHT_M)
 ):
     # Raster uploads are converted to a single-page PDF inside run_slice (see
     # slicer.image_to_pdf); the actual format decision there sniffs magic bytes.
@@ -38,6 +44,9 @@ async def slice_pdf(
     if not file.filename.lower().endswith(ACCEPTED_EXTENSIONS):
         raise HTTPException(
             400, f"Only {', '.join(ACCEPTED_EXTENSIONS)} files are accepted")
+
+    if page_height_m <= 0:
+        raise HTTPException(400, "page_height_m must be greater than 0")
 
     banderoll_bool = parse_bool(banderoll)
     skip_colors_bool = parse_bool(skip_colors)
@@ -62,6 +71,7 @@ async def slice_pdf(
         f"banderoll={banderoll!r} → {banderoll_bool}, "
         f"skip_colors={skip_colors!r} → {skip_colors_bool}, "
         f"ruta_nedre={ruta_nedre!r} → {ruta_nedre_bool}, "
+        f"page_height_m={page_height_m} (skissyta {STRIP_WIDTH_M}x{page_height_m} m), "
         f"colour_map={len(colour_map_dict)} entries"
     )
 
@@ -73,7 +83,8 @@ async def slice_pdf(
         banderoll=banderoll_bool,
         skip_colors=skip_colors_bool,
         ruta_nedre=ruta_nedre_bool,
-        colour_map=colour_map_dict
+        colour_map=colour_map_dict,
+        page_height_m=page_height_m
     )
 
     # TIF-60: unknown colors used to silently wipe the whole colour_map and ship

@@ -102,7 +102,11 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
     real_label = slicer._label_colors_on_page
     S = slicer.LABEL_RENDER_SCALE
 
-    def recording_label(page, color_map):
+    # **kw forwards whatever the real labeler's signature grows (TIF-87 added
+    # pn_excl, the already-scaled page-number exclusion box). Spelling the
+    # arguments out here means slice_one_strip calls this wrapper with a keyword
+    # it does not accept and the whole sweep dies with a TypeError.
+    def recording_label(page, color_map, **kw):
         nonlocal expected_total, placed_total, skipped_small_total
         # Independent recount of labelable patches on the clean page (before any
         # text lands on it) — this is what "zero skips" is checked against. The
@@ -119,7 +123,7 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
         expected_total      += sum(exp_by_code.values())
         skipped_small_total += sum(skip_by_code.values())
 
-        summary = real_label(page, color_map)
+        summary = real_label(page, color_map, **kw)
         for code, e in summary.items():
             t = totals.setdefault(code, [0, 0, 0])
             t[0] += e["count"]
@@ -134,7 +138,8 @@ def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
         for s in strips:
             strip_num, strip_bytes = slicer.slice_one_strip(
                 (s, pdf_bytes, width_m, height_m, num_strips, num_pages,
-                 dummy_map, ruta_nedre, False))   # skip_labels=False — labels are the point
+                 dummy_map, ruta_nedre, False,    # skip_labels=False — labels are the point
+                 slicer.PAGE_HEIGHT_M))           # TIF-87 page_height_m, appended
             os.makedirs(out_dir, exist_ok=True)
             if strip_num in pdf_strips:
                 # Actual labeled vector output (what production would upload),
