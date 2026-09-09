@@ -63,15 +63,19 @@ PEST_OVRE_MAP = {
     "#BC9164": "3030", "#D4D1CD": "1500", "#E5C598": "1515", "#EEA8CA": "Skip",
 }
 
-# kenta strip 14 (0-based index 13) is EXCLUDED. It crashes slice_one_strip with
-# "cannot save with zero pages" — a PRE-EXISTING bug unrelated to labeling, first
-# confirmed during TIF-69 (it reproduces identically at MIN_LABEL_PATCH_SIZE_PT=0.0,
-# i.e. the old pre-TIF-69 behaviour). Every page of that strip is fully background,
-# TIF-68 correctly excludes all of them, and slice_one_strip has no handling for a
-# strip left with zero pages. Tracked separately; excluded here so the default
-# sweep runs clean rather than dying on a known unrelated fault.
-KENTA_SKIP_STRIPS = {13}
-KENTA_STRIPS = [i for i in range(14) if i not in KENTA_SKIP_STRIPS]
+# kenta strip 14 (0-based index 13) is now INCLUDED again. It used to crash
+# slice_one_strip with "cannot save with zero pages" — every page of that strip is
+# fully background, TIF-68 correctly excludes all of them, and slice_one_strip had
+# no handling for a strip left with zero pages. It was excluded here from TIF-69
+# onward so the sweep would not die on a known unrelated fault.
+#
+# TIF-87 fixed it: such a strip now emits one blank pink page (keeping strip
+# numbering dense) instead of raising. Measured to be invariant to the Skissyta
+# page height — it fired identically at 1.0-8.0 m — so it was never a TIF-87
+# regression, just a crash worth fixing while the surrounding code was open.
+# Included again because it is now real coverage: a strip with nothing to label
+# must still produce a file.
+KENTA_STRIPS = list(range(14))
 
 # name -> (pdf, width_m, height_m, colour map, ruta_nedre, strips or None)
 DESIGNS = {

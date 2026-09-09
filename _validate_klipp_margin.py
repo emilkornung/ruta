@@ -114,7 +114,8 @@ def find_cut(pdf_bytes):
 def render(pdf_bytes):
     """Drive the real slice_one_strip; return the single output page."""
     _, out = slicer.slice_one_strip(
-        (0, pdf_bytes, W_M, H_M, 1, 1, COLOUR_MAP, True, True))
+        (0, pdf_bytes, W_M, H_M, 1, 1, COLOUR_MAP, True, True,
+         slicer.PAGE_HEIGHT_M))
     return fitz.open(stream=out, filetype="pdf")
 
 

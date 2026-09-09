@@ -7,3 +7,4 @@ __pycache__/
 # renders are force-added individually.
 validation/
 raster_test/
+tif87_out/

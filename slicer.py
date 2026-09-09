@@ -16,11 +16,21 @@ from scipy import ndimage
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+# ── Skissyta (the physical size of one printed ruta) ──────────────────────────
+#
+# STRIP_WIDTH_M is LOCKED (TIF-87). It is deliberately NOT configurable: it is
+# set by the fabric, not by the job. Every output page's HEIGHT is
+# STRIP_WIDTH_M * pts_per_m and therefore constant at 42.52 pt for every job.
+#
+# PAGE_HEIGHT_M is the DEFAULT for the per-job `page_height_m` parameter that is
+# threaded through run_slice -> _slice_pdf -> slice_one_strip -> generate_grid_pdf.
+# It is ALSO the value every historical job was produced at, so it must stay 4.0:
+# passing it (or leaving it defaulted) must reproduce master's output exactly.
 STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
 SLICE_WORKERS = 6
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # Page scale for raster (JPG/PNG) sources — see image_to_pdf().
 #
@@ -88,6 +98,19 @@ ENABLE_COLOR_LABELS   = True   # Master switch — color labeling is live in pro
                                # (TIF-27, validated and approved). Validation harnesses
                                # call _label_colors_on_page directly and are unaffected
                                # by this switch.
+# TIF-87: this does NOT scale with the Skissyta, and the reason is not merely
+# "it isn't a length". (1) There is no mechanism: it is a Euclidean distance in
+# RGB, and page geometry has no unit-bearing relationship to it. (2) The input it
+# guards is provably unchanged — tolerance absorbs RENDER DRIFT, which is a
+# function of render resolution per unit of artwork, and that is
+# LABEL_RENDER_SCALE * pts_per_m = 56.7 px per fabric metre at EVERY page height
+# (pts_per_m is derived from the DESIGN dimensions, never from the Skissyta —
+# see the Skissyta block at the top of this file). Interior pixels of a smaller
+# page are bit-identical to the same region on a larger one. (3) There is no
+# headroom to spend anyway: see the TIF-55 note below. What a smaller page does
+# change is the EDGE-pixel fraction, and that is the masking layer's job
+# (MIN_PATCH_PX + the 1-px border trims), not the colour band's — widening the
+# band to compensate would trade a mask problem for a colour-collision one.
 COLOR_MATCH_TOLERANCE = 28     # RGB Euclidean distance for matching a mapped color
                                # (handles render drift, same idea as pink/orange bands)
                                # TIF-55: tightly calibrated, not an arbitrary default.
@@ -198,6 +221,75 @@ KLIPP_MIN_FONT_SIZE_PT = 4.0   # pt of FONT SIZE — the smallest the label may 
 PAGE_NUM_EXCL_W  = 13.5  # pt reserved leftward from the right page edge
 PAGE_NUM_EXCL_Y0 = 4.0   # pt from the top edge (glyph top ≈ 5.7 minus pad)
 PAGE_NUM_EXCL_Y1 = 11.5  # pt from the top edge (baseline 10 plus pad)
+
+PAGE_NUM_FONT_PT   = 6.0   # pt — the orange page number's glyph size
+PAGE_NUM_INSET_PT  = 12.0  # pt leftward from the right page edge to its origin
+PAGE_NUM_BASELINE_PT = 10.0  # pt from the top edge to its baseline
+# These three were hardcoded inline in slice_one_strip (`width - 12`, `10`,
+# `fontsize=6`) even though PAGE_NUM_EXCL_* above exists precisely to reserve the
+# box they occupy — the two were only kept consistent by hand. Named here so the
+# reservation and the thing being reserved scale together (TIF-87).
+
+KLIPP_LINE_WIDTH_PT = 1.0  # pt — dashed cut-line stroke weight (furniture: it is
+                           # ink on the sheet, not a distance on the fabric)
+KLIPP_DASH_PT       = 4.0  # pt — dash and gap length of that line's pattern
+
+KLIPP_TEXT_PAD_PT = 2.0  # pt — clearance between the Klipp text's right limit and
+                         # the page-number exclusion zone. Was an unnamed `- 2.0`
+                         # inline in slice_one_strip (TIF-87).
+
+
+# ── Page furniture scaling (TIF-87) ───────────────────────────────────────────
+#
+# Two classes of constant live in this file and they behave differently when the
+# Skissyta's page height changes:
+#
+#   PHYSICAL (fabric-referenced) — KLIPP_MIN_PINK_PT, KLIPP_LINE_MARGIN_PT,
+#     MIN_LABEL_PATCH_SIZE_PT, MIN_PATCH_PX, LABEL_FONT_DEFAULT, label MARGIN.
+#     These are pt values that MEAN a distance on the fabric, and they are
+#     ALREADY invariant: pts_per_m is derived as full_w / width_m from the
+#     DESIGN, so 4.0 pt is 14.1 cm of fabric at every page height (measured
+#     across 1.0-8.0 m). They must NOT be scaled — scaling them is what would
+#     break their calibration, not what would preserve it.
+#
+#   FURNITURE (sheet-referenced) — the page number, the Klipp word, stroke
+#     weights. These are annotations ON the printed sheet, not measurements of
+#     fabric. Strip PDFs are viewed/printed at TRUE SCALE (fixed zoom), so a
+#     6 pt page number has the same apparent size on every job and SHOULD stay
+#     6 pt. Furniture is scaled for one reason only: FIT. Below a certain page
+#     height the furniture no longer physically fits on the sheet.
+#
+# Hence the anchor is the FIT FLOOR, not the default page height. Measured
+# floors, at STRIP_WIDTH_M = 1.5 (page_w = page_height_m * 28.3465):
+#     page_w > 13.50 pt  (PAGE_NUM_EXCL_W fits at all)  -> 0.476 m
+#     page_w > 18.67 pt  (2-digit page number fits)     -> 0.659 m
+#     page_w > 27.39 pt  ("Klipp" fits at its floor fs) -> 0.966 m
+# The binding one is ~0.97 m, so full-size furniture is guaranteed to fit at and
+# above 1.0 m and that is where the scale is anchored.
+#
+# Anchoring here rather than at PAGE_HEIGHT_M (4.0) is deliberate: a 4.0 anchor
+# would shrink the page number to 3 pt on a perfectly roomy 2 m ruta, making it
+# needlessly less readable at true scale for no fit reason. Change this one
+# constant to 4.0 if that judgement is ever reversed — nothing else moves.
+FURNITURE_FIT_FLOOR_M = 1.0
+
+
+def furniture_scale(page_height_m):
+    """
+    Multiplier for the FURNITURE class above, so page furniture keeps fitting on
+    a sheet shorter than FURNITURE_FIT_FLOOR_M. Never grows furniture.
+
+    CAPPED AT 1.0 ON PURPOSE. At every page height at or above the fit floor —
+    which includes the 4.0 m default and everything larger — this returns
+    exactly 1.0, and `x * 1.0` is exact in IEEE-754. So default output is
+    byte-identical to pre-TIF-87 master BY CONSTRUCTION, not merely by
+    verification. The regression digest checks that; this guarantees it.
+
+    Everything the scale touches is linear in it (widths, insets, font sizes,
+    stroke weights), so below the floor the whole furniture set shrinks
+    self-similarly and keeps fitting all the way down.
+    """
+    return min(1.0, page_height_m / FURNITURE_FIT_FLOOR_M)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -682,7 +774,7 @@ def _find_cut_boundary(src_doc, src_page_num, x0, x1, full_h, page_h_pts,
     return pn, cut_x
 
 
-def _label_colors_on_page(page, color_map):
+def _label_colors_on_page(page, color_map, pn_excl=None):
     """
     Map-driven, pixel-based color labeling for a single rendered strip page.
 
@@ -776,9 +868,17 @@ def _label_colors_on_page(page, color_map):
 
     # Seeded with the page number's reserved rect so fitted labels avoid the
     # spot where slice_one_strip will draw it after labeling.
-    placed_rects = [fitz.Rect(page.rect.width - PAGE_NUM_EXCL_W,
-                              PAGE_NUM_EXCL_Y0,
-                              page.rect.width, PAGE_NUM_EXCL_Y1)]
+    #
+    # pn_excl is the ALREADY-SCALED (w, y0, y1) triple from the caller (TIF-87):
+    # the page number shrinks below FURNITURE_FIT_FLOOR_M, so the box reserved
+    # for it has to shrink by the same factor or it would reserve dead space that
+    # the number no longer occupies. Defaults to the unscaled module constants so
+    # the validation guards that call this function directly keep working.
+    excl_w, excl_y0, excl_y1 = pn_excl or (PAGE_NUM_EXCL_W, PAGE_NUM_EXCL_Y0,
+                                           PAGE_NUM_EXCL_Y1)
+    placed_rects = [fitz.Rect(page.rect.width - excl_w,
+                              excl_y0,
+                              page.rect.width, excl_y1)]
     MARGIN       = 0.5  # pt clearance required between labels
 
     for npx, code, sl, sub_mask, dt, text_color in patches:
@@ -919,8 +1019,21 @@ def slice_one_strip(args):
     legacy pink/orange fallback, which cannot see a design whose background is
     some other declared Skip colour.
     """
+    # page_height_m is APPENDED at the end of the tuple (TIF-87) rather than
+    # inserted next to width_m/height_m, so the five external callers that build
+    # this tuple by hand (_design_label_harness and the _validate_* guards) need
+    # only append, and a review of this change can see at a glance that no
+    # existing positional meaning moved.
     (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map,
-     ruta_nedre, skip_labels) = args
+     ruta_nedre, skip_labels, page_height_m) = args
+
+    fscale = furniture_scale(page_height_m)
+    pn_excl_w  = PAGE_NUM_EXCL_W  * fscale
+    pn_excl_y0 = PAGE_NUM_EXCL_Y0 * fscale
+    pn_excl_y1 = PAGE_NUM_EXCL_Y1 * fscale
+    pn_font    = PAGE_NUM_FONT_PT * fscale
+    pn_inset   = PAGE_NUM_INSET_PT * fscale
+    pn_base    = PAGE_NUM_BASELINE_PT * fscale
 
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc = fitz.open()
@@ -933,7 +1046,7 @@ def slice_one_strip(args):
         pts_per_m_x = full_w / width_m
         pts_per_m_y = full_h / height_m
         strip_w_pts = STRIP_WIDTH_M * pts_per_m_x
-        page_h_pts  = PAGE_HEIGHT_M * pts_per_m_y
+        page_h_pts  = page_height_m * pts_per_m_y
 
         x0 = s * strip_w_pts
         x1 = min((s + 1) * strip_w_pts, full_w)
@@ -998,7 +1111,8 @@ def slice_one_strip(args):
             # Gated on skip_labels, NOT on the map being empty: pass A above still
             # needs the real map even when no labels are to be printed.
             if color_map and not skip_labels:
-                _label_colors_on_page(new_page, color_map)
+                _label_colors_on_page(new_page, color_map,
+                                      pn_excl=(pn_excl_w, pn_excl_y0, pn_excl_y1))
 
             # Pink padding on a GEOMETRICALLY partial page — the source clip did
             # not cover the full output page, so pad_x (= content_w) onwards is
@@ -1026,7 +1140,15 @@ def slice_one_strip(args):
                 # suppressed the whole marking (cut_page/cut_x would be None).
                 shape = new_page.new_shape()
                 shape.draw_line(fitz.Point(cut_x, 0), fitz.Point(cut_x, x1 - x0))
-                shape.finish(color=(0.15, 0.15, 0.15), width=1.0, dashes="[4 4] 0")
+                # cut_x is PHYSICAL (KLIPP_LINE_MARGIN_PT into the pink, unscaled);
+                # the stroke weight and dash period that DRAW it are furniture.
+                # %g so the default scale re-emits the original literal "[4 4] 0"
+                # rather than "[4.0 4.0] 0" — same rendering either way, but it
+                # keeps the CONTENT STREAM identical too, not just the pixels.
+                dash = f"{round(KLIPP_DASH_PT * fscale, 3):g}"
+                shape.finish(color=(0.15, 0.15, 0.15),
+                             width=KLIPP_LINE_WIDTH_PT * fscale,
+                             dashes=f"[{dash} {dash}] 0")
                 shape.commit()
 
                 # "Klipp" text — HARD RULE (TIF-67 Part 2): ALWAYS to the RIGHT of
@@ -1036,9 +1158,9 @@ def slice_one_strip(args):
                 # that zone's y-band, so the page number is the binding limit, same as
                 # TIF-57 used. "room" is the width available to the right of the line,
                 # before that zone.
-                right_limit = page_h_pts - PAGE_NUM_EXCL_W - 2.0
+                right_limit = page_h_pts - pn_excl_w - KLIPP_TEXT_PAD_PT * fscale
                 room        = right_limit - cut_x
-                if room >= KLIPP_TEXT_MIN_ROOM_PT:
+                if room >= KLIPP_TEXT_MIN_ROOM_PT * fscale:
                     # Width gate passed. Place the text a small gap right of the line
                     # and shrink to fit — but only down to KLIPP_MIN_FONT_SIZE_PT, a
                     # legibility floor (NOT the colour labeler's 0.1pt technical floor).
@@ -1047,20 +1169,21 @@ def slice_one_strip(args):
                     # width; if even the floor size is too wide, SKIP the text rather
                     # than shrink it into illegibility. The line still stands, and the
                     # text is never placed left — skipping is the only fallback.
-                    text_x0 = cut_x + KLIPP_TEXT_GAP_PT
-                    avail   = right_limit - text_x0
-                    sizes   = [KLIPP_FONT_DEFAULT]
-                    while sizes[-1] * LABEL_FONT_SHRINK > KLIPP_MIN_FONT_SIZE_PT:
+                    text_x0   = cut_x + KLIPP_TEXT_GAP_PT * fscale
+                    avail     = right_limit - text_x0
+                    klipp_min = KLIPP_MIN_FONT_SIZE_PT * fscale
+                    sizes     = [KLIPP_FONT_DEFAULT * fscale]
+                    while sizes[-1] * LABEL_FONT_SHRINK > klipp_min:
                         sizes.append(round(sizes[-1] * LABEL_FONT_SHRINK, 3))
-                    if sizes[-1] > KLIPP_MIN_FONT_SIZE_PT:
-                        sizes.append(KLIPP_MIN_FONT_SIZE_PT)
+                    if sizes[-1] > klipp_min:
+                        sizes.append(klipp_min)
                     chosen = next(
                         (sz for sz in sizes
                          if fitz.get_text_length("Klipp", fontsize=sz) <= avail),
                         None)
                     if chosen is not None:
                         new_page.insert_text(
-                            fitz.Point(text_x0, 10),
+                            fitz.Point(text_x0, pn_base),
                             "Klipp",
                             fontsize = chosen,
                             color    = (0.15, 0.15, 0.15),
@@ -1068,9 +1191,9 @@ def slice_one_strip(args):
 
             # Small orange page number, tight to top right corner
             new_page.insert_text(
-                fitz.Point(new_page.rect.width - 12, 10),
+                fitz.Point(new_page.rect.width - pn_inset, pn_base),
                 str(page_num + 1),
-                fontsize = 6,
+                fontsize = pn_font,
                 color    = (1, 0.5, 0),
             )
 
@@ -1085,6 +1208,44 @@ def slice_one_strip(args):
                   f"{cut_page + 1}, which is_fully_background() excluded from "
                   f"rendering. No Klipp marking drawn for this strip.")
 
+    # A strip every page of which is_fully_background() excluded ends up with no
+    # pages at all, and out_doc.save() then raises "cannot save with zero pages",
+    # failing the WHOLE job (the exception propagates out of the thread pool in
+    # _slice_pdf). kenta strip 14 does exactly this — it is solid background top
+    # to bottom.
+    #
+    # NOT a TIF-87 regression, and measured not to be: it fires identically at
+    # every page_height_m from 1.0 to 8.0 m, the default 4.0 included, i.e. it is
+    # invariant to the parameter this ticket added (a strip's content is a
+    # property of its column, and the column is fixed once the strip width is).
+    # Fixed here because the crash is real either way and a half-configured
+    # Skissyta is a bad place to leave a job-killing exception.
+    #
+    # Emit ONE blank page rather than dropping the strip: strip files are named
+    # strip-NN and an operator counts them against the grid PDF, so a missing
+    # number reads as a bug they have to chase. A blank page says "this strip is
+    # all background" in the one place they will actually look.
+    #
+    # PINK_PAD even on an orange-background design: this page carries no artwork,
+    # so the fill is a placeholder for "nothing here", and PINK_PAD is already the
+    # colour this module paints dead space with.
+    # `src_doc.page_count` guards the page_h_pts/strip_w_pts read below: both are
+    # bound inside the `for src_page` loop, so a (pathological) zero-page source
+    # would make this a NameError — strictly worse than the ValueError it fixes.
+    if out_doc.page_count == 0 and src_doc.page_count:
+        blank = out_doc.new_page(width=page_h_pts, height=strip_w_pts)
+        shape = blank.new_shape()
+        shape.draw_rect(blank.rect)
+        shape.finish(fill=(PINK_PAD_R, PINK_PAD_G, PINK_PAD_B),
+                     fill_opacity=1.0, color=None)
+        shape.commit()
+        blank.insert_text(
+            fitz.Point(blank.rect.width - pn_inset, pn_base),
+            "1", fontsize=pn_font, color=(1, 0.5, 0),
+        )
+        print(f"    NOTE: strip {s + 1} — every page is background; emitting one "
+              f"blank page so strip numbering stays dense.")
+
     buf = io.BytesIO()
     out_doc.save(buf)
     out_doc.close()
@@ -1093,14 +1254,15 @@ def slice_one_strip(args):
 
 
 def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False,
-               skip_labels=False):
+               skip_labels=False, page_height_m=None):
     """Slice pdf_bytes into vertical strips in parallel. Returns sorted list of (strip_num, bytes)."""
+    page_height_m = PAGE_HEIGHT_M if page_height_m is None else page_height_m
     num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
-    num_pages  = math.ceil(height_m / PAGE_HEIGHT_M)
+    num_pages  = math.ceil(height_m / page_height_m)
 
     args = [
         (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {},
-         ruta_nedre, skip_labels)
+         ruta_nedre, skip_labels, page_height_m)
         for s in range(num_strips)
     ]
 
@@ -1115,7 +1277,8 @@ def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False,
     return [(n, results[n]) for n in sorted(results)]
 
 
-def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False):
+def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False,
+                      page_height_m=None):
     """
     Generate a rotated grid overview that matches the sliced strips.
 
@@ -1131,17 +1294,18 @@ def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False):
     still strip 0 = the leftmost design column — so the Rad left-to-right order is
     identical to default.
     """
+    page_height_m = PAGE_HEIGHT_M if page_height_m is None else page_height_m
     src_doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc    = fitz.open()
     num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
-    num_pages  = math.ceil(height_m / PAGE_HEIGHT_M)
+    num_pages  = math.ceil(height_m / page_height_m)
 
     for src_page in src_doc:
         r       = src_page.rect
         full_w  = r.width
         full_h  = r.height
         strip_w_pts = STRIP_WIDTH_M * (full_w / width_m)
-        page_h_pts  = PAGE_HEIGHT_M * (full_h / height_m)
+        page_h_pts  = page_height_m * (full_h / height_m)
 
         # Grid-y band [ny0, ny1] occupied by strip s. rotate=90 flips design-x→y
         # so for ruta_nedre the band is mirrored about full_w (keeps the label on
@@ -1218,9 +1382,21 @@ def run_slice(
     skip_colors: bool = False,
     ruta_nedre: bool = False,
     colour_map: dict = None,
+    page_height_m: float = None,
 ) -> dict:
     """
     Slices a PDF into 1.5m-wide vertical strips.
+
+    page_height_m is the Skissyta's page height — how tall one printed ruta is,
+    in metres (TIF-87). None means PAGE_HEIGHT_M (4.0), the value every job
+    before TIF-87 was produced at; passing 4.0 explicitly is identical. The
+    strip WIDTH is deliberately not a parameter: it is fixed by the fabric, not
+    by the job (see the Skissyta block at the top of this module).
+
+    Only page-FURNITURE constants react to it, and only below
+    FURNITURE_FIT_FLOOR_M — see furniture_scale(). Fabric-referenced constants
+    are already invariant, because pts-per-metre is derived from the DESIGN
+    dimensions rather than from the Skissyta.
 
     Accepts a JPG or PNG in place of a PDF (sniffed from the bytes, see
     is_raster_source). A raster upload is converted to a single-page PDF first —
@@ -1333,14 +1509,17 @@ def run_slice(
         unknown_colors = find_unknown_colors(hex_colors, color_map)
 
     strips_raw = _slice_pdf(pdf_bytes, width_m, height_m, color_map,
-                            ruta_nedre=ruta_nedre, skip_labels=effective_skip)
+                            ruta_nedre=ruta_nedre, skip_labels=effective_skip,
+                            page_height_m=page_height_m)
 
     strips = [
         {"filename": f"strip-{strip_num:02d}.pdf", "bytes": strip_bytes}
         for strip_num, strip_bytes in strips_raw
     ]
 
-    grid_bytes = generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=ruta_nedre)
+    grid_bytes = generate_grid_pdf(pdf_bytes, width_m, height_m,
+                                   ruta_nedre=ruta_nedre,
+                                   page_height_m=page_height_m)
 
     return {"strips": strips, "unknown_colors": unknown_colors,
             "grid_pdf": grid_bytes, "colors_analyzed": colors_analyzed}

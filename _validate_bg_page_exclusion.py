@@ -80,7 +80,8 @@ def _make_trailing_pink_design():
 def _render_pages(pdf_bytes, W, H, nedre, strip):
     ns = math.ceil(W / slicer.STRIP_WIDTH_M)
     npg = math.ceil(H / slicer.PAGE_HEIGHT_M)
-    _, out = slicer.slice_one_strip((strip, pdf_bytes, W, H, ns, npg, {}, nedre, True))
+    _, out = slicer.slice_one_strip((strip, pdf_bytes, W, H, ns, npg, {}, nedre, True,
+                                     slicer.PAGE_HEIGHT_M))
     return fitz.open(stream=out, filetype="pdf")
 
 

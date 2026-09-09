@@ -95,7 +95,8 @@ def _slice(pdf_path, W, H, strip, nedre, cmap, skip_labels):
     ns  = math.ceil(W / slicer.STRIP_WIDTH_M)
     npg = math.ceil(H / slicer.PAGE_HEIGHT_M)
     _, b = slicer.slice_one_strip(
-        (strip, pdf_bytes, W, H, ns, npg, cmap, nedre, skip_labels))
+        (strip, pdf_bytes, W, H, ns, npg, cmap, nedre, skip_labels,
+         slicer.PAGE_HEIGHT_M))
     return fitz.open(stream=b, filetype="pdf")
 
 
