@@ -30,7 +30,7 @@ STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
 SLICE_WORKERS = 6
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # Page scale for raster (JPG/PNG) sources — see image_to_pdf().
 #
@@ -64,6 +64,45 @@ ORANGE_THRESHOLD           = 0.85
 ORANGE_R_MIN               = 220
 ORANGE_G_MIN, ORANGE_G_MAX = 90, 165
 ORANGE_B_MAX               = 60
+
+# Lilac background detection — the pale pink-violet #F9CDE7 (R249 G205 B231) used
+# as a whole-page background by some designs. Same tier and same mechanism as the
+# PINK_*/ORANGE_* bands above: it feeds is_fully_background() ONLY, so a page that
+# is >= FULLY_BG_THRESHOLD of this colour is dropped from the output entirely. It
+# is deliberately NOT added to _background_mask() (the Klipp content scan) or to
+# any colour-labeling path — those answer a different question ("where does the
+# artwork stop on a page we are keeping") and have their own, map-driven
+# classifier. Page exclusion only.
+#
+# WIDTH — +/-15 per channel, not the +/-40 the pink and orange bands carry. Those
+# two are wide because each has to cover a FAMILY of background hues across
+# designs; this one covers a single declared hex, so it only has to absorb render
+# drift on a solid fill (measured at 0 units at BG_SAMPLE_SCALE=0.5 — the interior
+# of a solid fill renders bit-exact; the anti-aliased border is trimmed before the
+# fraction is taken).
+#
+# 15 is also the WIDEST value that keeps this band provably disjoint from the pink
+# one, and that is what sets it. Pink requires g < PINK_G_MAX = 190; this band
+# requires g > LILAC_G_MIN = 190. Both comparisons are strict, so no integer g
+# satisfies both and the two bands cannot classify the same pixel — proven on the
+# G channel alone, whatever R and B do. #F9CDE7's G is 205, exactly 15 above that
+# boundary, so the band is symmetric at the largest tolerance disjointness allows.
+# The R and B half-widths follow at 15 for consistency; both channels overlap
+# pink's ranges and are load-bearing for nothing but drift. DO NOT widen G past
+# this without re-deriving the separation — at +/-20 the bands collide and a real
+# design's intentional pink reads as this background, or vice versa.
+#
+# KNOWN SIDE EFFECT (measured, accepted): the anti-aliased ramp from a pink
+# background into white passes through this band (#EEA8CB->white at ~25-60% of
+# the way), so on pink/white artwork those fringe pixels now count as background
+# where they used to count as content. Across every clip of kenta, pest-mitten,
+# pest-ovre and ENAD this raised a page's background fraction by at most +1.25
+# points and flipped ZERO exclusion decisions; the closest rendered page sits at
+# 0.951, 2.9 points under FULLY_BG_THRESHOLD. It errs toward DROPPING, so it is
+# the first place to look if a pink/white page near the threshold ever vanishes.
+LILAC_R_MIN              = 234          # 249 - 15, open above (as PINK/ORANGE do)
+LILAC_G_MIN, LILAC_G_MAX = 190, 220     # 205 +/- 15; 190 == PINK_G_MAX, the separator
+LILAC_B_MIN, LILAC_B_MAX = 216, 246     # 231 +/- 15
 
 # Render scale for is_fully_background's colour sample (TIF-68). Was 0.05, which
 # rendered a full page to ~20-28 px and a partial to as few as ~15 — far too coarse
@@ -295,10 +334,15 @@ def furniture_scale(page_height_m):
 
 def is_fully_background(src_doc, src_page_num, clip):
     """
-    Render the clip region and check if it's mostly the light pink background
-    (~R244 G144 B181) OR the orange background (~R255 G128 B0). Returns True if
-    more than FULLY_BG_THRESHOLD of pixels match either colour, meaning the page has
-    no real content worth printing.
+    Render the clip region and check if it's mostly one of the recognised
+    background colours: the light pink (~R244 G144 B181), the orange (~R255 G128
+    B0), or the lilac #F9CDE7 (~R249 G205 B231). Returns True if more than
+    FULLY_BG_THRESHOLD of pixels match ANY of them, meaning the page has no real
+    content worth printing.
+
+    The three bands are mutually exclusive by construction, so a pixel is counted
+    once: orange needs b < 60 where both pinks need b > 140, and lilac needs
+    g > 190 where pink needs g < 190 (see the LILAC_* block for the derivation).
 
     TIF-68: three coupled fixes for why genuinely-empty pages were not excluded.
     (1) BG_SAMPLE_SCALE was 0.05, far too coarse to be faithful, so a ~100%-background
@@ -326,7 +370,11 @@ def is_fully_background(src_doc, src_page_num, clip):
                  & (g > ORANGE_G_MIN) & (g < ORANGE_G_MAX)
                  & (b < ORANGE_B_MAX)
                  & (r > g) & (g > b))
-    bg = is_pink | is_orange
+    is_lilac = ((r > LILAC_R_MIN)
+                & (g > LILAC_G_MIN) & (g < LILAC_G_MAX)
+                & (b > LILAC_B_MIN) & (b < LILAC_B_MAX)
+                & (r > g) & (r > b))
+    bg = is_pink | is_orange | is_lilac
     # Discard the 1-px border ring — partial-coverage raster artifact, not artwork.
     if bg.shape[0] >= 3 and bg.shape[1] >= 3:
         bg = bg[1:-1, 1:-1]

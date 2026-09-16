@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.6.0 — 2026-09-16
+
+**Pages that are fully lilac `#F9CDE7` are now dropped from the output, the same way fully pink and fully orange pages already are.**
+
+- **New `LILAC_*` band in `is_fully_background()`**: `R > 234`, `190 < G < 220`, `216 < B < 246`, plus `R > G` and `R > B` (the same guards the pink band uses). A page where more than `FULLY_BG_THRESHOLD` (0.98) of the pixels fall in pink, orange **or** lilac is no longer rendered.
+- **Only page exclusion is affected.** `_background_mask()` (the Klipp content scan), `colour_map`, Skip handling and colour labeling are all unchanged. A page that is only *partly* lilac still renders, and the Klipp scan still counts its lilac as content.
+
+### Why ±15 and not the ±40 that pink and orange use
+
+The pink and orange bands are wide because each one has to catch a whole *family* of background shades across designs. This band only has to catch one colour, so all it needs to absorb is render drift. On a solid `#F9CDE7` fill at `BG_SAMPLE_SCALE=0.5` that drift measured **0**: every inside pixel came out exactly (249,205,231).
+
+±15 is also **the widest band that cannot overlap pink.** Pink needs `G < 190` and lilac needs `G > 190`. Both checks are strict, so no pixel can pass both. `#F9CDE7` has G = 205, exactly 15 above that line. At ±20 the two bands would share colours.
+
+### Verification
+
+- **Overlap, checked over every one of the 16,777,216 RGB colours:** pink∩lilac = **0**, orange∩lilac = **0**. Now a permanent check (1e) in `_validate_bg_page_exclusion.py`.
+- **End to end through `slice_one_strip`:** a trailing page that is 100% `#F9CDE7` renders on 1.5.0 (3 pages come out) and is excluded on 1.6.0 (2 pages). A page that is about 90% lilac with a 10% strip of content is still kept. Both are new permanent checks (1c, 1d).
+- **Real designs, before vs. after:** every page clip of kenta, pest-mitten, pest-övre and ENAD (433 clips, using `run_guards.py`'s dimensions) went through the sampler with and without the new band. **No page changed between rendered and excluded.**
+- **Known side effect, measured:** where pink meets white, the anti-aliased edge pixels blend into lilac's range (for `#EEA8CB`→white, about 25–60% of the way to white). So on pink-and-white art the background fraction goes up slightly: by at most **+1.25 percentage points** (pest-övre) and +0.80 (pest-mitten), and not at all on kenta and ENAD. The nearest affected page that still renders is pest-övre strip 1 page 1: 0.9473 → 0.9509, still 2.9 points below 0.98. This pushes toward dropping pages, so if pink/white designs sit close to the threshold in future, look here first.
+- `run_guards.py` (default sweep): all three designs PASS zero-skip. Every standalone `_validate_*` guard passes.
+
 ## 1.5.0 — 2026-09-08
 
 **The Skissyta's page height is now a per-job parameter (TIF-87). Default output is unchanged — byte-identical, and proven so.**

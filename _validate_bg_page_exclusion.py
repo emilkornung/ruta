@@ -25,6 +25,9 @@ WHAT IT ASSERTS
   2. REAL DESIGN (skipped if the pdf is absent): pest-mitten at its named 24x31.5 dims
      — the configuration that produced the reported strip-16 bug — must not emit ANY
      blank background page (>= 95% background with only a page number on it).
+  3. LILAC #F9CDE7 (always runs): a trailing 100%-lilac page is excluded (1c), a
+     ~90%-lilac page with a content sliver is kept (1d), and the LILAC_* band is
+     disjoint from PINK_* and ORANGE_* over the whole RGB cube (1e).
 
 Run:  python _validate_bg_page_exclusion.py
 """
@@ -39,6 +42,8 @@ import slicer
 
 PINK_HEX = "#EEA8CB"                                    # pest-mitten's real pink Skip
 PINK_RGB = tuple(int(PINK_HEX[i:i + 2], 16) / 255 for i in (1, 3, 5))
+LILAC_HEX = "#F9CDE7"                                   # LILAC_* background band
+LILAC_RGB = tuple(int(LILAC_HEX[i:i + 2], 16) / 255 for i in (1, 3, 5))
 
 
 def _bg_fraction(page):
@@ -50,7 +55,9 @@ def _bg_fraction(page):
            (b > slicer.PINK_B_MIN) & (b < slicer.PINK_B_MAX) & (r > g) & (r > b)
     org = (r > slicer.ORANGE_R_MIN) & (g > slicer.ORANGE_G_MIN) & (g < slicer.ORANGE_G_MAX) & \
           (b < slicer.ORANGE_B_MAX) & (r > g) & (g > b)
-    return float((pink | org).mean())
+    lilac = (r > slicer.LILAC_R_MIN) & (g > slicer.LILAC_G_MIN) & (g < slicer.LILAC_G_MAX) & \
+            (b > slicer.LILAC_B_MIN) & (b < slicer.LILAC_B_MAX) & (r > g) & (r > b)
+    return float((pink | org | lilac).mean())
 
 
 def _is_blank_bg_page(page):
@@ -61,9 +68,10 @@ def _is_blank_bg_page(page):
     return _bg_fraction(page) >= 0.95 and only_number
 
 
-def _make_trailing_pink_design():
+def _make_trailing_pink_design(bg_rgb=PINK_RGB):
     """One 1.5m strip, 12m tall (3 x 4m pages) at ~28.35 pt/m. Pages 1-2 are black
-    content; page 3 is a FULL, 100% pink page — a trailing fully-background page."""
+    content; page 3 is a FULL, 100% background page (pink by default) — a trailing
+    fully-background page."""
     ppm = 28.35
     full_w = 1.5 * ppm                 # ~42.5 pt strip
     full_h = 12.0 * ppm                # 3 pages
@@ -73,8 +81,22 @@ def _make_trailing_pink_design():
     page.draw_rect(fitz.Rect(0, 0, full_w, 2 * page_h),
                    color=(0, 0, 0), fill=(0, 0, 0))          # pages 1-2 content
     page.draw_rect(fitz.Rect(0, 2 * page_h, full_w, full_h),
-                   color=PINK_RGB, fill=PINK_RGB)            # page 3 fully pink
+                   color=bg_rgb, fill=bg_rgb)                # page 3 fully background
     return doc.tobytes()
+
+
+def _make_sliver_design(bg_rgb):
+    """One 1.5m strip, 8m tall (2 x 4m pages). Page 1 is black content; page 2 is
+    ~90% background with a ~10% black content sliver — a page that MUST render."""
+    ppm = 28.35
+    fw = 1.5 * ppm; fh = 8.0 * ppm; ph = 4.0 * ppm      # 2 pages
+    d = fitz.open(); pg = d.new_page(width=fw, height=fh)
+    pg.draw_rect(fitz.Rect(0, 0, fw, ph), color=(0, 0, 0), fill=(0, 0, 0))       # page 1 content
+    pg.draw_rect(fitz.Rect(0, ph, fw, fh), color=bg_rgb, fill=bg_rgb)            # page 2 mostly bg
+    pg.draw_rect(fitz.Rect(0, ph, fw, ph + 0.1 * ph),                            # ...with a content sliver
+                 color=(0, 0, 0), fill=(0, 0, 0))
+    out = d.tobytes(); d.close()
+    return out
 
 
 def _render_pages(pdf_bytes, W, H, nedre, strip):
@@ -117,15 +139,7 @@ def run():
     # trailing page is ~90% pink with a ~10% black content sliver and assert it
     # renders (is NOT excluded). This pins the over-exclusion direction that TIF-68's
     # scale fix, at the old 0.85 threshold, would have regressed.
-    ppm = 28.35
-    fw = 1.5 * ppm; fh = 8.0 * ppm; ph = 4.0 * ppm      # 2 pages
-    d = fitz.open(); pg = d.new_page(width=fw, height=fh)
-    pg.draw_rect(fitz.Rect(0, 0, fw, ph), color=(0, 0, 0), fill=(0, 0, 0))       # page 1 content
-    pg.draw_rect(fitz.Rect(0, ph, fw, fh), color=PINK_RGB, fill=PINK_RGB)        # page 2 mostly pink
-    pg.draw_rect(fitz.Rect(0, ph, fw, ph + 0.1 * ph),                            # ...with a content sliver
-                 color=(0, 0, 0), fill=(0, 0, 0))
-    sliver_pdf = d.tobytes(); d.close()
-    doc = _render_pages(sliver_pdf, 1.5, 8.0, True, 0)
+    doc = _render_pages(_make_sliver_design(PINK_RGB), 1.5, 8.0, True, 0)
     n_sliver = doc.page_count
     doc.close()
     print(f"1b CONTENT-SLIVER page (~10% content, ~90% pink): "
@@ -133,6 +147,52 @@ def run():
     if n_sliver != 2:
         fails.append(f"1b CONTENT-SLIVER: expected 2 pages, got {n_sliver} — a page "
                      f"with a real content sliver was wrongly excluded (over-exclusion)")
+
+    # ── 1c. LILAC #F9CDE7: trailing full page must not render ─────────────────
+    # Same fixture as 1, background swapped for the LILAC_* band's colour. Proven
+    # meaningful the same way: on the parent commit (no LILAC_* band) page 3 renders.
+    doc = _render_pages(_make_trailing_pink_design(LILAC_RGB), 1.5, 12.0, True, 0)
+    n_lilac = doc.page_count
+    blank = [i + 1 for i, pg in enumerate(doc) if _is_blank_bg_page(pg)]
+    doc.close()
+    print(f"1c SYNTHETIC trailing-lilac page (3 pages, page 3 = full 100% {LILAC_HEX}):")
+    print(f"    {n_lilac} pages rendered, blank-bg pages: {blank}")
+    if blank or n_lilac != 2:
+        fails.append(f"1c LILAC: expected 2 content pages and no blank page, got "
+                     f"{n_lilac} pages, blank {blank} — is_fully_background failed to "
+                     f"exclude a 100% {LILAC_HEX} page")
+
+    # ── 1d. LILAC content sliver must be KEPT (over-exclusion guard) ─────────
+    doc = _render_pages(_make_sliver_design(LILAC_RGB), 1.5, 8.0, True, 0)
+    n_lsliver = doc.page_count
+    doc.close()
+    print(f"1d CONTENT-SLIVER page (~10% content, ~90% lilac): "
+          f"{n_lsliver} pages rendered (expect 2 — the sliver page must be KEPT)")
+    if n_lsliver != 2:
+        fails.append(f"1d LILAC CONTENT-SLIVER: expected 2 pages, got {n_lsliver} — a "
+                     f"lilac page with a real content sliver was wrongly excluded")
+
+    # ── 1e. LILAC is DISJOINT from PINK and ORANGE ───────────────────────────
+    # Exhaustive over all 256^3 triples. An overlap would let a design's intentional
+    # pink read as lilac background (or vice versa). Also pins that the known real
+    # pinks stay pink-only.
+    v = np.arange(256, dtype=np.int32)
+    R, G, B = v[:, None, None], v[None, :, None], v[None, None, :]
+    in_pink = (R > slicer.PINK_R_MIN) & (G > slicer.PINK_G_MIN) & (G < slicer.PINK_G_MAX) & \
+              (B > slicer.PINK_B_MIN) & (B < slicer.PINK_B_MAX) & (R > G) & (R > B)
+    in_org = (R > slicer.ORANGE_R_MIN) & (G > slicer.ORANGE_G_MIN) & (G < slicer.ORANGE_G_MAX) & \
+             (B < slicer.ORANGE_B_MAX) & (R > G) & (G > B)
+    in_lilac = (R > slicer.LILAC_R_MIN) & (G > slicer.LILAC_G_MIN) & (G < slicer.LILAC_G_MAX) & \
+               (B > slicer.LILAC_B_MIN) & (B < slicer.LILAC_B_MAX) & (R > G) & (R > B)
+    n_pl, n_ol = int((in_pink & in_lilac).sum()), int((in_org & in_lilac).sum())
+    print(f"1e BAND DISJOINTNESS over 256^3: pink&lilac={n_pl}  orange&lilac={n_ol}")
+    if n_pl or n_ol:
+        fails.append(f"1e BANDS OVERLAP: pink&lilac={n_pl} orange&lilac={n_ol} RGB triples")
+    for hx in ("#F490B5", PINK_HEX, "#EEA8CA"):
+        t = tuple(int(hx[i:i + 2], 16) for i in (1, 3, 5))
+        if not in_pink[t] or in_lilac[t]:
+            fails.append(f"1e {hx}: expected pink-only, got pink={bool(in_pink[t])} "
+                         f"lilac={bool(in_lilac[t])}")
 
     # ── 2. REAL DESIGN: pest-mitten at its named 24x31.5 dims ─────────────────
     pest = "pest mitten 24x31,5m.pdf"
@@ -160,7 +220,7 @@ def run():
     for m in fails:
         print(f"  FAIL {m}")
     ok = not fails
-    print("BACKGROUND-PAGE EXCLUSION CHECK (TIF-68):", "PASS" if ok else f"FAIL ({len(fails)})")
+    print("BACKGROUND-PAGE EXCLUSION CHECK (TIF-68 + LILAC):", "PASS" if ok else f"FAIL ({len(fails)})")
     return ok
 
 
