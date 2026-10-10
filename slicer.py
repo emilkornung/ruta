@@ -130,14 +130,15 @@ FULLY_BG_THRESHOLD = 0.98
 # Pink padding color for partial pages (0–1 RGB)
 PINK_PAD_R, PINK_PAD_G, PINK_PAD_B = 0.957, 0.565, 0.710  # ≈ #F490B5
 
-# TIF-96: a geometrically partial page is padded with the colour the content ENDS
-# in, not with PINK_PAD, so the page reads as one continuous colour. PINK_PAD stays
-# as the fallback when no single end colour can be read, and for artwork-less
-# placeholder pages. The end colour is sampled from rendered pixels of a thin band
-# at the source edge that the padding abuts.
-END_COLOUR_BAND_PT   = 4.0   # depth of the sampled band, source points
-END_COLOUR_SCALE     = 2.0   # render scale for the sample
-END_COLOUR_DOMINANCE = 0.75  # modal colour must cover this much of the band, else ambiguous
+# TIF-96: a geometrically partial page is padded with the design's own colours, not
+# PINK_PAD: the padding CONTINUES the edge it abuts, position by position, so the
+# page reads as one continuous colour. PINK_PAD survives only for artwork-less
+# placeholder pages and as the fallback when the edge cannot be sampled at all.
+# The edge is sampled from rendered pixels of a thin band at the source edge.
+END_COLOUR_BAND_PT  = 4.0   # depth of the sampled band, source points
+END_COLOUR_SCALE    = 2.0   # render scale for the sample
+END_RUN_TOL         = 6     # adjacent columns within this per-channel distance share one run
+END_RUN_MAX         = 48    # cap on rects per padded page; tolerance doubles until the edge fits
 
 # ── Color labeling (map-driven, pixel-based) ───────────────────────────────────
 # Rebuilt pipeline. Operates on each already-rendered, already-sliced strip page
@@ -1057,18 +1058,21 @@ def extract_pdf_colors(pdf_bytes):
 
 # ── Core slicing ──────────────────────────────────────────────────────────────
 
-def _content_end_colour(src_doc, src_page_num, x0, x1, full_h, ruta_nedre):
+def _content_end_runs(src_doc, src_page_num, x0, x1, full_h, ruta_nedre):
     """
-    TIF-96: the colour a strip's content ends in, as a 0-1 RGB tuple, or None when
-    there is no single such colour (caller falls back to PINK_PAD).
+    TIF-96: the colours a strip's content ends in, position by position along the
+    padded edge, as [(rgb01, f0, f1), ...] runs covering 0..1 of the strip width in
+    SOURCE-x order; None only when the edge cannot be sampled at all (caller falls
+    back to PINK_PAD and says so).
 
     The padding abuts the SOURCE page edge the clip ran into: y=0 (design top) under
-    the default rotation, y=full_h (design bottom) under ruta_nedre — the same edge
-    slice_one_strip's partial branch documents. A thin band at that edge is rendered
-    and its 1-px ring trimmed (clip-boundary anti-aliasing, as in
-    is_fully_background); the most common exact pixel value is the end colour,
-    provided it covers END_COLOUR_DOMINANCE of the band. A gradient or a
-    multi-colour edge has no dominant value and returns None rather than guessing.
+    the default rotation, y=full_h (design bottom) under ruta_nedre. A thin band at
+    that edge is rendered and its 1-px ring trimmed (clip-boundary anti-aliasing, as
+    in is_fully_background). Each column takes the most common exact pixel value
+    over the band depth — ties go to the row nearest the edge — which is robust to a
+    thin line hugging the edge. Adjacent columns within END_RUN_TOL share a run, and the
+    run count is capped at END_RUN_MAX, so the result is a handful of rects, never
+    one per pixel. A flat edge is exactly one run.
     """
     depth = min(END_COLOUR_BAND_PT, full_h)
     band  = (fitz.Rect(x0, full_h - depth, x1, full_h) if ruta_nedre
@@ -1078,13 +1082,71 @@ def _content_end_colour(src_doc, src_page_num, x0, x1, full_h, ruta_nedre):
     if pix.width < 3 or pix.height < 3:
         return None
     arr = np.frombuffer(pix.samples, dtype=np.uint8)             .reshape(pix.height, pix.width, pix.n)[1:-1, 1:-1, :3].astype(np.int64)
+    if ruta_nedre:
+        arr = arr[::-1]                       # row 0 = nearest the edge, both modes
     packed = (arr[:, :, 0] << 16) | (arr[:, :, 1] << 8) | arr[:, :, 2]
-    vals, counts = np.unique(packed, return_counts=True)
-    k = int(np.argmax(counts))
-    if counts[k] / packed.size < END_COLOUR_DOMINANCE:
-        return None
-    v = int(vals[k])
-    return ((v >> 16) / 255.0, ((v >> 8) & 255) / 255.0, (v & 255) / 255.0)
+    ncol = packed.shape[1]
+    cols = []
+    for j in range(ncol):
+        v, first, cnt = np.unique(packed[:, j], return_index=True, return_counts=True)
+        cols.append(int(v[min(range(len(v)), key=lambda i: (-cnt[i], first[i]))]))
+
+    def rgb(v):
+        return (v >> 16, (v >> 8) & 255, v & 255)
+
+    def runs_at(tol):
+        out = []                               # [colour, start_col, end_col(excl)]
+        for j, v in enumerate(cols):
+            if out and max(abs(p - q) for p, q in zip(rgb(out[-1][0]), rgb(v))) <= tol:
+                out[-1][2] = j + 1
+            else:
+                out.append([v, j, j + 1])
+        return out
+
+    # A 1-column run of in-between colour at a flat/flat boundary is the true
+    # anti-aliased transition, so it is KEPT (absorbing slivers would also flatten a
+    # gradient, whose every column is "a sliver"). The count is bounded instead: if
+    # the edge is noisy enough to exceed END_RUN_MAX, widen the tolerance until it fits.
+    tol = END_RUN_TOL
+    runs = runs_at(tol)
+    while len(runs) > END_RUN_MAX and tol < 255:
+        tol *= 2
+        runs = runs_at(tol)
+    total = ncol + 2                           # the trimmed ring columns rejoin the end runs
+    out = []
+    for i, (v, c0, c1) in enumerate(runs):
+        f0 = 0.0 if i == 0 else (c0 + 1) / total
+        f1 = 1.0 if i == len(runs) - 1 else (c1 + 1) / total
+        out.append(tuple(c / 255.0 for c in rgb(v)) + (f0, f1))
+    return [((r, g, b), f0, f1) for r, g, b, f0, f1 in out]
+
+
+def _draw_pad_runs(page, runs, pad_x, page_w, page_h, ruta_nedre):
+    """
+    Paint the padding (pad_x..page_w, full page height) as one rect per colour run
+    from _content_end_runs. Runs are in source-x order, which maps onto the output
+    page's y axis straight under the default rotation (270) and mirrored under
+    ruta_nedre (rotate 90) — measured, see _validate_partial_pad.py. A single run
+    is the whole pad in one rect — what a flat edge always produced.
+    """
+    rects = []
+    for rgb, f0, f1 in runs:
+        if ruta_nedre:
+            y0, y1 = (1 - f1) * page_h, (1 - f0) * page_h
+        else:
+            y0, y1 = f0 * page_h, f1 * page_h
+        rects.append((rgb, y0, y1))
+    rects.sort(key=lambda r: r[1])
+    shape = page.new_shape()
+    for i, (rgb, y0, _) in enumerate(rects):
+        # Each rect runs from its start to the END of the page and is painted over by
+        # the next, rather than abutting it or overlapping by a sliver: at a boundary
+        # pixel the later colour then blends over a fully covered earlier one, where
+        # abutting or sliver-overlapped edges would blend each partial coverage with
+        # the white page and leave a lighter hairline.
+        shape.draw_rect(fitz.Rect(pad_x, 0 if i == 0 else y0, page_w, page_h))
+        shape.finish(fill=rgb, fill_opacity=1.0, color=None)
+    shape.commit()
 
 
 def slice_one_strip(args):
@@ -1209,12 +1271,13 @@ def slice_one_strip(args):
             # the pad fills the right — the design's free outer edge. rotate makes
             # that edge the design TOP (default) or BOTTOM (ruta_nedre).
             if is_partial:
-                shape = new_page.new_shape()
-                shape.draw_rect(fitz.Rect(pad_x, 0, page_h_pts, x1 - x0))
-                pad_fill = _content_end_colour(src_doc, src_page.number, x0, x1,
-                                               full_h, ruta_nedre)                            or (PINK_PAD_R, PINK_PAD_G, PINK_PAD_B)
-                shape.finish(fill=pad_fill, fill_opacity=1.0, color=None)
-                shape.commit()
+                runs = _content_end_runs(src_doc, src_page.number, x0, x1,
+                                         full_h, ruta_nedre)
+                if runs is None:
+                    print(f"    NOTE: strip {s + 1} page {page_num + 1} — padding edge "
+                          f"could not be sampled; padded with PINK_PAD.")
+                    runs = [((PINK_PAD_R, PINK_PAD_G, PINK_PAD_B), 0.0, 1.0)]
+                _draw_pad_runs(new_page, runs, pad_x, page_h_pts, x1 - x0, ruta_nedre)
 
             # Dashed cut line + "Klipp" — drawn on the ONE page per strip that
             # holds the content boundary found by pass A, at cut_x (which already

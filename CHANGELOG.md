@@ -2,12 +2,13 @@
 
 ## 1.7.0 — 2026-10-10
 
-**Partial pages are now padded with the colour the content ends in, not a fixed pink (TIF-96).**
+**Partial pages are now padded with the design's own colours, continuing the edge they abut, not a fixed pink (TIF-96).**
 
-- On a geometrically partial page, the padding next to the content used to be `PINK_PAD` (`#F490B5`) whatever the design. It is now the colour at the content's end edge, so the page reads as one continuous colour (e.g. a lilac `#F9CDE7` design is padded lilac).
-- **Which edge:** the source edge the padding abuts — design top by default, design bottom under `ruta_nedre`.
-- **How the colour is found:** a 4 pt band at that edge is rendered, its 1-px ring trimmed, and the most common exact pixel value is used. Nothing is hard-coded; the colour comes from the pixels.
-- **Fallback:** if no single colour covers at least 75% of the band (gradient, two-colour edge) the padding stays `PINK_PAD` rather than guessing. Artwork-less placeholder pages and the raster alpha underlay are unchanged and stay `PINK_PAD`.
+- On a geometrically partial page the padding used to be `PINK_PAD` (`#F490B5`) whatever the design. It now **continues the content's end edge position by position**: a lilac `#F9CDE7` end gets lilac padding, a two-colour edge gets two-colour padding, a gradient edge a gradient.
+- **Which edge:** the source edge the padding abuts — design top by default, design bottom under `ruta_nedre`. Source-x maps straight onto the output page's y under the default rotation and mirrored under `ruta_nedre` (verified, both modes).
+- **How the colour is found:** a 4 pt band at that edge is rendered and its 1-px ring trimmed. Each column takes the most common exact pixel value over the band (ties to the row nearest the edge), so a thin line hugging the edge doesn't win. Adjacent columns within ±6 per channel become one run; if an edge is so noisy it exceeds 48 runs, the tolerance doubles until it fits. A flat edge is exactly one run and one rect.
+- **Drawing:** one rect per run, each painted from its start to the page end and overpainted by the next, so no run boundary leaves a hairline of the white page.
+- **Fallback:** `PINK_PAD` only if the edge cannot be sampled at all (prints a `NOTE`). Artwork-less placeholder pages and the raster alpha underlay stay `PINK_PAD`.
 - **Unchanged:** full pages, labels (padding is drawn after labeling), the Klipp line and text, page exclusion (`is_fully_background` only sees the content clip).
 - **Guards:** new `_validate_partial_pad.py`; `_validate_klipp_partial.py` now recognises the pad by geometry instead of by pink colour.
 

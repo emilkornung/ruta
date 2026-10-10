@@ -9,8 +9,8 @@ modes. The padding abuts design TOP (default rotation) or design BOTTOM
 
 Cases: lilac-, orange-, pink- and blue-ended designs (padding must equal the end
 colour, and no stray PINK_PAD may remain unless the end colour IS pink-ish), plus
-AMBIGUOUS edges (two colours side by side; a gradient) which must fall back to
-PINK_PAD rather than guess. Also checks the example fixture
+two-colour split and gradient edges, where the padding must CONTINUE the edge
+position by position (each pad row == the adjacent content pixel, both rotations). Also checks the example fixture
 (Example color add.pdf) when it is present next to this file or in ~/Downloads.
 
 Not part of the production pipeline. Exits non-zero on any failure.
@@ -52,7 +52,7 @@ def build(edge, nedre):
         n = 40
         for i in range(n):
             v = i / (n - 1)
-            p.draw_rect(fitz.Rect(W * i / n, r.y0, W * (i + 1) / n, r.y1),
+            p.draw_rect(fitz.Rect(W * i / n, r.y0, W * (i + 1) / n + 1, r.y1),  # +1: overlap, no seams
                         fill=(v, 0.2, 1 - v), color=None)
     # real content inside the partial page, clear of the edge band
     y = (H - 0.6 * PTS) if nedre else 0.3 * PTS
@@ -68,13 +68,36 @@ def pad_pixels(strip_bytes):
     return len(doc), [tuple(pm.pixel(x, int(pm.height * f))[:3]) for f in (.25, .5, .75)]
 
 
+def check_continues(strip_bytes):
+    """TIF-96 per-position rule: every pad row equals the content pixel next to it
+    (the design's own colour continues across the seam), and no PINK_PAD remains."""
+    doc = fitz.open(stream=strip_bytes, filetype="pdf")
+    pm = doc[len(doc) - 1].get_pixmap(dpi=72)
+    px_ = int(PTS) - 3                      # a column just inside the 1 m partial content
+    x = pm.width - 20
+    bad, tol = [], 12                       # gradient steps / seam blend: a few levels
+    for y in range(3, pm.height - 3):
+        b = pm.pixel(x, y)[:3]
+        up, dn = pm.pixel(px_, y - 1)[:3], pm.pixel(px_, y + 1)[:3]
+        if max(abs(p - q) for p, q in zip(up, dn)) > 3 * tol:
+            continue                        # a genuine colour boundary: the seam row blends
+        # +/-1 row: a colour boundary lands within half a pt of where the 0.5 pt
+        # sampling grid puts it, so the seam row may match its neighbour instead.
+        if not any(max(abs(p - q) for p, q in zip(pm.pixel(px_, yy)[:3], b)) <= tol
+                   for yy in (y - 1, y, y + 1)):
+            bad.append(f"row {y}: pad {b} != adjacent content {pm.pixel(px_, y)[:3]}")
+        if b == PINK_PX:
+            bad.append(f"row {y}: stray PINK_PAD in padding")
+    return bad[:3]
+
+
 def main():
     fails, n = [], 0
     lilac, orange, pink, blue = (249, 205, 231), (255, 128, 0), (238, 168, 203), (30, 90, 200)
     cases = [("lilac", ("solid", lilac), lilac), ("orange", ("solid", orange), orange),
              ("pink", ("solid", pink), pink), ("blue", ("solid", blue), blue),
-             ("ambiguous-split", ("split", (200, 30, 30), blue), None),
-             ("ambiguous-gradient", ("gradient",), None)]
+             ("split", ("split", (200, 30, 30), blue), "continue"),
+             ("gradient", ("gradient",), "continue")]
     for nedre in (False, True):
         for name, edge, want in cases:
             n += 1
@@ -84,9 +107,8 @@ def main():
             if pages != 2:
                 fails.append(f"{tag}: expected 2 pages, got {pages}")
                 continue
-            if want is None:
-                if any(p != PINK_PX for p in px):
-                    fails.append(f"{tag}: ambiguous edge must fall back to PINK_PAD {PINK_PX}, got {px}")
+            if want == "continue":
+                fails.extend(f"{tag}: {m}" for m in check_continues(res[0][1]))
             else:
                 if any(p != want for p in px):
                     fails.append(f"{tag}: pad {px} != end colour {want}")

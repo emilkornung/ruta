@@ -60,15 +60,19 @@ def _has_pink_fill(page):
     kept (callers unchanged).
     """
     pw, ph = page.rect.width, page.rect.height
-    # The pad is drawn after the content, so it is the LAST filled drawing; checking
-    # only that one keeps a full page's own flush-right background rects from
-    # reading as padding.
-    fills = [dr for dr in page.get_drawings() if dr.get("fill")]
-    if not fills:
-        return False
-    r = fills[-1]["rect"]
-    return (abs(r.x1 - pw) <= 0.01 and abs(r.y0) <= 0.01 and abs(r.y1 - ph) <= 0.01
-            and r.width < pw - 1)
+    # The pad is drawn after the content, so it is the TRAILING run of filled rects.
+    # Since TIF-96 it can be several rects (one per colour run), every one ending at
+    # the page's bottom-right corner, the first spanning the full height. Walking only
+    # that trailing family keeps a full page's own flush-right background rects (which
+    # overshoot the page edge) from reading as padding.
+    fills = [dr["rect"] for dr in page.get_drawings() if dr.get("fill")]
+    tail = []
+    for r in reversed(fills):
+        if abs(r.x1 - pw) <= 0.01 and abs(r.y1 - ph) <= 0.01 and r.width < pw - 1:
+            tail.append(r)
+        else:
+            break
+    return any(abs(r.y0) <= 0.01 for r in tail)
 
 
 def _dashed_line_x(page):
