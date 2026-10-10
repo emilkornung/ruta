@@ -30,7 +30,7 @@ STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
 SLICE_WORKERS = 6
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # Page scale for raster (JPG/PNG) sources — see image_to_pdf().
 #
@@ -129,6 +129,15 @@ FULLY_BG_THRESHOLD = 0.98
 
 # Pink padding color for partial pages (0–1 RGB)
 PINK_PAD_R, PINK_PAD_G, PINK_PAD_B = 0.957, 0.565, 0.710  # ≈ #F490B5
+
+# TIF-96: a geometrically partial page is padded with the colour the content ENDS
+# in, not with PINK_PAD, so the page reads as one continuous colour. PINK_PAD stays
+# as the fallback when no single end colour can be read, and for artwork-less
+# placeholder pages. The end colour is sampled from rendered pixels of a thin band
+# at the source edge that the padding abuts.
+END_COLOUR_BAND_PT   = 4.0   # depth of the sampled band, source points
+END_COLOUR_SCALE     = 2.0   # render scale for the sample
+END_COLOUR_DOMINANCE = 0.75  # modal colour must cover this much of the band, else ambiguous
 
 # ── Color labeling (map-driven, pixel-based) ───────────────────────────────────
 # Rebuilt pipeline. Operates on each already-rendered, already-sliced strip page
@@ -1048,6 +1057,36 @@ def extract_pdf_colors(pdf_bytes):
 
 # ── Core slicing ──────────────────────────────────────────────────────────────
 
+def _content_end_colour(src_doc, src_page_num, x0, x1, full_h, ruta_nedre):
+    """
+    TIF-96: the colour a strip's content ends in, as a 0-1 RGB tuple, or None when
+    there is no single such colour (caller falls back to PINK_PAD).
+
+    The padding abuts the SOURCE page edge the clip ran into: y=0 (design top) under
+    the default rotation, y=full_h (design bottom) under ruta_nedre — the same edge
+    slice_one_strip's partial branch documents. A thin band at that edge is rendered
+    and its 1-px ring trimmed (clip-boundary anti-aliasing, as in
+    is_fully_background); the most common exact pixel value is the end colour,
+    provided it covers END_COLOUR_DOMINANCE of the band. A gradient or a
+    multi-colour edge has no dominant value and returns None rather than guessing.
+    """
+    depth = min(END_COLOUR_BAND_PT, full_h)
+    band  = (fitz.Rect(x0, full_h - depth, x1, full_h) if ruta_nedre
+             else fitz.Rect(x0, 0, x1, depth))
+    mat = fitz.Matrix(END_COLOUR_SCALE, END_COLOUR_SCALE)
+    pix = src_doc[src_page_num].get_pixmap(matrix=mat, clip=band, colorspace=fitz.csRGB)
+    if pix.width < 3 or pix.height < 3:
+        return None
+    arr = np.frombuffer(pix.samples, dtype=np.uint8)             .reshape(pix.height, pix.width, pix.n)[1:-1, 1:-1, :3].astype(np.int64)
+    packed = (arr[:, :, 0] << 16) | (arr[:, :, 1] << 8) | arr[:, :, 2]
+    vals, counts = np.unique(packed, return_counts=True)
+    k = int(np.argmax(counts))
+    if counts[k] / packed.size < END_COLOUR_DOMINANCE:
+        return None
+    v = int(vals[k])
+    return ((v >> 16) / 255.0, ((v >> 8) & 255) / 255.0, (v & 255) / 255.0)
+
+
 def slice_one_strip(args):
     """
     Slice a single strip from the source PDF. Runs in a thread.
@@ -1172,7 +1211,9 @@ def slice_one_strip(args):
             if is_partial:
                 shape = new_page.new_shape()
                 shape.draw_rect(fitz.Rect(pad_x, 0, page_h_pts, x1 - x0))
-                shape.finish(fill=(PINK_PAD_R, PINK_PAD_G, PINK_PAD_B), fill_opacity=1.0, color=None)
+                pad_fill = _content_end_colour(src_doc, src_page.number, x0, x1,
+                                               full_h, ruta_nedre)                            or (PINK_PAD_R, PINK_PAD_G, PINK_PAD_B)
+                shape.finish(fill=pad_fill, fill_opacity=1.0, color=None)
                 shape.commit()
 
             # Dashed cut line + "Klipp" — drawn on the ONE page per strip that

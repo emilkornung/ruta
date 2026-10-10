@@ -39,6 +39,7 @@ separate scripts, each run on its own:
     _validate_klipp_margin.py          TIF-67 margin + text ladder
     _validate_bg_page_exclusion.py     TIF-68 trailing background page
     _validate_raster_source.py         TIF-73 JPG/PNG sources
+    _validate_partial_pad.py           TIF-96 partial-page padding end colour
 """
 import os
 import sys

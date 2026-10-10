@@ -52,11 +52,23 @@ def _spans(page):
 
 
 def _has_pink_fill(page):
-    for dr in page.get_drawings():
-        f = dr.get("fill")
-        if f and all(abs(a - b) < 0.03 for a, b in zip(f, PINK)):
-            return True
-    return False
+    """True iff the slicer drew a padding rect on this page.
+
+    TIF-96: the pad is now the content's END colour, not fixed PINK_PAD, so it can
+    no longer be recognised by colour. It is the filled rect that runs the full
+    page height out to the right page edge without covering the whole page. Name
+    kept (callers unchanged).
+    """
+    pw, ph = page.rect.width, page.rect.height
+    # The pad is drawn after the content, so it is the LAST filled drawing; checking
+    # only that one keeps a full page's own flush-right background rects from
+    # reading as padding.
+    fills = [dr for dr in page.get_drawings() if dr.get("fill")]
+    if not fills:
+        return False
+    r = fills[-1]["rect"]
+    return (abs(r.x1 - pw) <= 0.01 and abs(r.y0) <= 0.01 and abs(r.y1 - ph) <= 0.01
+            and r.width < pw - 1)
 
 
 def _dashed_line_x(page):
@@ -78,7 +90,7 @@ def check_page(page, page_label, narrow):
     line_x = _dashed_line_x(page)
 
     if not _has_pink_fill(page):
-        fails.append("pink padding rect missing")
+        fails.append("padding rect missing")
     if line_x is None:
         fails.append("dashed cut line missing")
 

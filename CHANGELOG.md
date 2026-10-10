@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.0 — 2026-10-10
+
+**Partial pages are now padded with the colour the content ends in, not a fixed pink (TIF-96).**
+
+- On a geometrically partial page, the padding next to the content used to be `PINK_PAD` (`#F490B5`) whatever the design. It is now the colour at the content's end edge, so the page reads as one continuous colour (e.g. a lilac `#F9CDE7` design is padded lilac).
+- **Which edge:** the source edge the padding abuts — design top by default, design bottom under `ruta_nedre`.
+- **How the colour is found:** a 4 pt band at that edge is rendered, its 1-px ring trimmed, and the most common exact pixel value is used. Nothing is hard-coded; the colour comes from the pixels.
+- **Fallback:** if no single colour covers at least 75% of the band (gradient, two-colour edge) the padding stays `PINK_PAD` rather than guessing. Artwork-less placeholder pages and the raster alpha underlay are unchanged and stay `PINK_PAD`.
+- **Unchanged:** full pages, labels (padding is drawn after labeling), the Klipp line and text, page exclusion (`is_fully_background` only sees the content clip).
+- **Guards:** new `_validate_partial_pad.py`; `_validate_klipp_partial.py` now recognises the pad by geometry instead of by pink colour.
+
 ## 1.6.0 — 2026-09-16
 
 **Pages that are fully lilac `#F9CDE7` are now dropped from the output, the same way fully pink and fully orange pages already are.**
