@@ -28,53 +28,15 @@ import time
 
 import fitz
 import numpy as np
-from scipy import ndimage
 
 import slicer
+# The SINGLE definition of the zero-skip contract. It lived here until TIF-88
+# moved it into probe.py, where the synthetic suite shares it; re-exported so
+# _validate_color_labels.py and any other importer keep working unchanged.
+from probe import count_labelable_patches  # noqa: F401  (re-export)
 
 PNG_SCALE = 8.0
 OUT_DIR   = "validation"
-
-
-def count_labelable_patches(arr, color_map):
-    """
-    Independently recount the connected patches on a rendered page, split by the
-    TIF-69 size gate. This is the SINGLE definition of the "zero skips" contract,
-    shared by run_design() here and by _validate_color_labels.py — before TIF-71
-    that second guard had its own copy that never learned about the size gate and
-    silently failed from the TIF-69 merge onward.
-
-    `arr` must be (H, W, 3) int, rendered at slicer.LABEL_RENDER_SCALE (the scale
-    the labeler itself analyses at). Returns two {code: n} dicts:
-
-      expected       -- patches >= MIN_PATCH_PX whose inscribed-circle radius is
-                        >= MIN_LABEL_PATCH_SIZE_PT. Every one of these MUST get
-                        exactly one label.
-      skipped_small  -- patches >= MIN_PATCH_PX but below that radius floor.
-                        Expected to be skipped (TIF-69) — reported, never
-                        asserted on.
-
-    Uses the labeler's own nearest-colour per-code masks (slicer._code_masks) and
-    the same distance-transform inscribed-circle metric (r_pts) its sizing ladder
-    uses, so the recount cannot drift from what the labeler actually does.
-    """
-    S = slicer.LABEL_RENDER_SCALE
-    expected, skipped_small = {}, {}
-    for code, mask in slicer._code_masks(arr, color_map).items():
-        lbl, num = ndimage.label(mask)
-        if num == 0:
-            continue
-        counts  = np.bincount(lbl.ravel())
-        objects = ndimage.find_objects(lbl)
-        for comp in range(1, num + 1):
-            if counts[comp] < slicer.MIN_PATCH_PX:
-                continue
-            sub_mask = lbl[objects[comp - 1]] == comp
-            dt = ndimage.distance_transform_edt(np.pad(sub_mask, 1))[1:-1, 1:-1]
-            r_pts = float(dt.max()) / S
-            bucket = skipped_small if r_pts < slicer.MIN_LABEL_PATCH_SIZE_PT else expected
-            bucket[code] = bucket.get(code, 0) + 1
-    return expected, skipped_small
 
 
 def run_design(pdf_path, width_m, height_m, dummy_map, prefix, strips=None,
