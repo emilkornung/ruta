@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.0 — 2026-10-25
+
+**New: a colour-labeled grid overview, `grid_labeled_pdf`, next to the existing `grid_pdf` (TIF-95).**
+
+- **It replays the strips' labels; it does not label the grid.** `_label_colors_on_page` now also records each label exactly as drawn (`"placed"`: draw order, origin, size; `"text_color"`). `_slice_one_strip` collects them as `LabelPlacement`s, and `generate_grid_pdfs` redraws them on the grid. Labelling stays per strip page (TIF-27), so the grid says exactly what each strip says. A patch split across two strips gets one label on each.
+- **The mapping is a pure translation.** Strip `s`, printing page `p`, strip-page point `(x, y)` → grid `(p·page_h + x, band0(s) + y)`. `band0 = s·strip_w` by default, or `full_w − min((s+1)·strip_w, full_w)` under `ruta_nedre`. Verified pixel-level in both modes at page heights 1.0–6.0 m.
+- **Emitted only when at least one label was placed.** `skip_colors`, raster uploads, and labeled jobs that place nothing get `grid_labeled_pdf: null`.
+- **Each cell's labels are clipped to that cell.** This is a temporary workaround for TIF-104: when white is mapped, the labeler also labels a partial page's blank area, and the pink pad then hides that label. It is still replayed, so the counts stay equal, but the clip keeps it invisible on the grid too. Remove the clip once TIF-104 is fixed.
+- **Rad/Ruta reference text tidied on both grids.** Scaled by `GRID_REF_FONT_SCALE` (0.45: 6 pt → 2.7 pt) at `GRID_REF_OPACITY` 0.30. Every reference text is now one line: "Rad s / Ruta p", or "Rs/Rp" where that does not fit, shrunk if needed. Before, the side label wrapped as "Ra/d 1" and ran into the cell text at small page heights. The side label now sits on its band's centre line and moves below the cell text, or is left out where the band is too thin (every cell already names its Rad).
+- **Unchanged:** strips are byte-identical to 1.6.0 (trailer `/ID` aside, which is random per save). In `grid_pdf` only the Rad/Ruta text changed; the grid lines and the design render are identical.
+- **Guard:** synthetic section O in `synth_cases.py` checks three-way parity on every job: labels the labeler reported = label spans on the strips = label spans on the labeled grid. It also compares per-label multisets, with the mapping restated independently. It covers both modes, page heights 1, 4 and 6 m, short numeric codes, micro, forced and 0.1 pt labels, seam straddlers, excluded and partial pages, and the TIF-104 shape. It also checks that no label ink falls outside its own cell, that jobs without labels get no labeled grid, and the Rad/Ruta layout.
+
 ## 1.6.0 — 2026-09-16
 
 **Pages that are fully lilac `#F9CDE7` are now dropped from the output, the same way fully pink and fully orange pages already are.**

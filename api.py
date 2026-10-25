@@ -111,6 +111,10 @@ async def slice_pdf(
             "unknown_colors=[] means NOT CHECKED, not 'all colors matched'."
         )
 
+    if result["grid_labeled_pdf"] is None:
+        logger.info("No paint-code labels placed; grid_labeled_pdf is null "
+                    "(only the plain grid is returned).")
+
     return {
         "strips": [
             {
@@ -120,6 +124,11 @@ async def slice_pdf(
             for s in result["strips"]
         ],
         "grid_pdf": base64.b64encode(result["grid_pdf"]).decode(),
+        # TIF-95: the same grid with the strips' paint-code labels on top. null
+        # when the job placed no labels (skip_colors, raster, or nothing mapped),
+        # so the client shows only grid_pdf then.
+        "grid_labeled_pdf": (base64.b64encode(result["grid_labeled_pdf"]).decode()
+                             if result["grid_labeled_pdf"] is not None else None),
         "unknown_colors": result["unknown_colors"],
         "colors_analyzed": result["colors_analyzed"]
     }
