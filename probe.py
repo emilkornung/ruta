@@ -134,6 +134,93 @@ def strip_facts(strip_bytes):
     return pages
 
 
+# ── labeled grid (TIF-95) ────────────────────────────────────────────────────
+# get_texttrace, NOT get_text("dict"): it reports one entry per text-showing
+# operation, so two adjacent labels with the same style can never merge into one
+# span and silently lose a count, and nothing is dropped for being tiny.
+
+GRID_RED = (0.9, 0.1, 0.1)
+_FURNITURE_GREY = (0.15, 0.15, 0.15)
+
+
+def trace(page):
+    """Every text operation on the page: dicts of text, origin x/y, size, colour
+    (rounded to 3 dp), glyph bbox, opacity."""
+    out = []
+    for t in page.get_texttrace():
+        if not t["chars"]:
+            continue
+        x, y = t["chars"][0][2]
+        out.append({"text": "".join(chr(c[0]) for c in t["chars"]), "x": x, "y": y,
+                    "size": t["size"], "color": tuple(round(c, 3) for c in t["color"]),
+                    "bbox": fitz.Rect(t["bbox"]), "opacity": t["opacity"]})
+    return out
+
+
+def strip_labels(strip_bytes):
+    """[(page_num, span)] for every paint-code label on a strip PDF. page_num is
+    read from the page's own orange number, because a page excluded by
+    is_fully_background leaves a gap: the PDF page index is not page_num.
+    Furniture is removed EXACTLY, never by a text pattern: the page number is
+    orange AND all digits, Klipp is dark grey AND the literal "Klipp". A short
+    numeric code ("S", "1500") is black/white and so can never match either."""
+    out = []
+    doc = fitz.open(stream=strip_bytes, filetype="pdf")
+    for i, pg in enumerate(doc):
+        sp = trace(pg)
+        pn = [t for t in sp if t["color"] == (1.0, 0.5, 0.0) and t["text"].strip().isdigit()]
+        if len(pn) != 1:
+            raise AssertionError(f"strip page {i + 1}: {len(pn)} page numbers")
+        page_num = int(pn[0]["text"]) - 1
+        for t in sp:
+            if t is pn[0] or (t["color"] == _FURNITURE_GREY and t["text"] == "Klipp"):
+                continue
+            out.append((page_num, t))
+    doc.close()
+    return out
+
+
+def grid_texts(grid_bytes):
+    """(labels, refs) on page 1 of a grid PDF: refs are the red Rad/Ruta texts."""
+    doc = fitz.open(stream=grid_bytes, filetype="pdf")
+    sp = trace(doc[0])
+    doc.close()
+    return ([t for t in sp if t["color"] != GRID_RED],
+            [t for t in sp if t["color"] == GRID_RED])
+
+
+def match_labels(a, b, tol=0.01):
+    """Multiset match of (text, x, y, size, colour) tuples, positions within tol.
+    Returns (only_in_a, only_in_b)."""
+    pool = {}
+    for t in b:
+        pool.setdefault((t[0], round(t[3], 3), t[4]), []).append([t[1], t[2], False])
+    only_a = []
+    for t in a:
+        cands = pool.get((t[0], round(t[3], 3), t[4]), [])
+        hit = next((c for c in cands if not c[2] and abs(c[0] - t[1]) <= tol
+                    and abs(c[1] - t[2]) <= tol), None)
+        if hit is None:
+            only_a.append(t)
+        else:
+            hit[2] = True
+    only_b = [(k[0], c[0], c[1], k[1], k[2]) for k, cs in pool.items() for c in cs if not c[2]]
+    return only_a, only_b
+
+
+def render_wide(pdf_bytes, extra_w, scale=2.0):
+    """Page 1 rendered WITH alpha on a mediabox widened by extra_w to the right,
+    so ink drawn past the page edge (and white text on nothing) becomes visible."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pg = doc[0]
+    r = pg.mediabox
+    pg.set_mediabox(fitz.Rect(r.x0, r.y0, r.x1 + extra_w, r.y1))
+    pix = pg.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=True)
+    a = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n).astype(int)
+    doc.close()
+    return a
+
+
 # ── the zero-skip contract (moved from _design_label_harness, TIF-88) ────────
 
 def count_labelable_patches(arr, color_map):

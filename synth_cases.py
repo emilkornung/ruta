@@ -22,6 +22,7 @@ expect keys (all optional; see _validate_synthetic.evaluate):
   stdout_has, stdout_lacks
 """
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -897,3 +898,303 @@ add(Case("scale/100ppm-constants-are-absolute-pt",
          "constant is absolute pt — at 100 pt/m the line is still exactly 4pt past b*",
          d, job=dict(nedre=True, cmap=SKIP_MAP),
          expect=dict(cut=spec_cut(b, 400.0, 1), page_w=400.0, page_h=150.0)))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# O. Labeled grid (TIF-95): every strip label replayed onto the grid, none lost
+# ════════════════════════════════════════════════════════════════════════════
+#
+# The HARD criterion, three counts that must be equal per job:
+#   1. labels the labeler reported placing (LabelRecorder, wraps the real labeler)
+#   2. label spans on the finished strip PDFs (get_texttrace, furniture removed
+#      exactly, see probe.strip_labels)
+#   3. label spans on grid_labeled_pdf
+# and the strip labels, moved to the grid by THIS file's own statement of the
+# mapping (not slicer's), equal the grid labels as multisets of (text, origin,
+# size, colour). The mapping: strip s, printing page p, strip-page point (x, y)
+#   grid x = p * page_h + x
+#   grid y = band0(s) + y,  band0 = s * strip_w                              (default)
+#                           band0 = full_w - min((s+1) * strip_w, full_w)  (ruta_nedre)
+
+G3000 = "#B2B0AE"          # 3000 in the real map
+LABELS_104 = {SKIP_PINK: "Skip", GREEN: "3560", GREY: "1500", G3000: "3000",
+              BLACK: "S", WHITE: "Vit"}
+REF_TEXT = re.compile(r"(Rad \d+ / Ruta \d+|R\d+/R\d+|Rad \d+)")
+
+
+def grid_fixture():
+    """4.0 x 13.0 m on Skip pink: strips 1.5/1.5/1.0, a partial last page at 4 and
+    6 m page heights. Short/numeric codes (S, Vit, 1500, 3000, 3560), patches
+    straddling both strip seams, patches on the design's outer edges, a dense
+    micro cluster of 4-digit codes on 2 pt squares (labels well under 1 pt), an
+    all-pink band (pages excluded by is_fully_background), content on the
+    partial page."""
+    d = Design(4.0, 13.0).background(SKIP_PINK)
+    m = synth.PPM
+    d.band(0, 3.5 * m, GREY)
+    for i, c in enumerate((GREEN, BLACK, WHITE, G3000)):
+        d.patch(6 + i * 26, 0.5 * m, 20, 20, c)
+    d.patch(d.strip_w - 12, 1.6 * m, 24, 18, GREEN)          # straddles seam 1|2
+    d.patch(2 * d.strip_w - 9, 2.4 * m, 18, 12, BLACK)       # straddles seam 2|3
+    d.patch(0.2, 2.9 * m, 6, 6, BLACK)                       # design's left edge
+    d.patch(d.full_w - 6.2, 3.0 * m, 6, 6, GREEN)            # design's right edge
+    d.patch_grid(60, 1.9 * m, 6, 6, 2.0, 0.5, GREEN)          # micro: "3560" < 1 pt
+    d.patch_grid(20, 2.6 * m, 5, 5, 2.0, 0.5, WHITE)
+    d.band(5.5 * m, 8.5 * m, G3000)
+    for j in range(8):
+        d.patch(5 + j * 13, 7.9 * m, 9, 0.5 * m, (GREEN, BLACK, WHITE, GREY)[j % 4])
+    d.rect(d.strip_w, 9.0 * m, 2 * d.strip_w, 12.6 * m, GREY)
+    for j in range(5):
+        d.patch(d.strip_w + 4 + j * 8, 12.2 * m, 5, 5, (GREEN, BLACK, WHITE, G3000, GREEN)[j])
+    return d
+
+
+def _grid_geometry(d, nedre, page_height_m):
+    ph = d.page_h(page_height_m)
+
+    def cell(s, p):
+        x0, x1 = d.strip_x(s)
+        b0 = d.full_w - x1 if nedre else x0
+        return fitz.Rect(p * ph, b0, min((p + 1) * ph, d.full_h), b0 + (x1 - x0))
+    return ph, cell
+
+
+def _replay_parity(placed, strip_side, grid_bytes, grid_plain, extra_w):
+    """The checks shared by the job cases and the hand-made replay case.
+    placed: count 1. strip_side: [(text, gx, gy, size, colour, grid bbox, cell)]."""
+    fails = []
+    grid_lab, grid_ref = probe.grid_texts(grid_bytes)
+    n2, n3 = len(strip_side), len(grid_lab)
+    if not placed == n2 == n3:
+        fails.append(f"COUNT PARITY: labeler {placed}, strip spans {n2}, grid spans {n3}")
+    only_s, only_g = probe.match_labels(
+        [t[:5] for t in strip_side],
+        [(t["text"], t["x"], t["y"], t["size"], t["color"]) for t in grid_lab])
+    if only_s:
+        fails.append(f"{len(only_s)} strip label(s) missing/moved on the grid: {only_s[:3]}")
+    if only_g:
+        fails.append(f"{len(only_g)} grid label(s) with no strip label: {only_g[:3]}")
+    # labeled grid == plain grid + labels: same reference text, plain has no labels
+    plain_lab, plain_ref = probe.grid_texts(grid_plain)
+    if plain_lab:
+        fails.append(f"grid_pdf carries {len(plain_lab)} non-reference text(s)")
+
+    def key(t):
+        return t["text"], round(t["x"], 3), round(t["y"], 3), round(t["size"], 3)
+    if sorted(map(key, plain_ref)) != sorted(map(key, grid_ref)):
+        fails.append("Rad/Ruta text differs between grid_pdf and grid_labeled_pdf")
+    # CLIP (TIF-104 workaround): every pixel the labels add, on a page widened so
+    # anything drawn past its edge shows, lies in some label's (bbox ∩ own cell).
+    S = 2.0
+    a = probe.render_wide(grid_bytes, extra_w, S)
+    b = probe.render_wide(grid_plain, extra_w, S)
+    diff = np.abs(a - b).max(axis=2) > 32
+    allowed = np.zeros(diff.shape, bool)
+    for t in strip_side:
+        r = t[5] & t[6]
+        if r.is_empty:
+            continue
+        allowed[max(0, int(r.y0 * S) - 2):int(np.ceil(r.y1 * S)) + 2,
+                max(0, int(r.x0 * S) - 2):int(np.ceil(r.x1 * S)) + 2] = True
+    stray = diff & ~allowed
+    if stray.any():
+        ys, xs = np.nonzero(stray)
+        fails.append(f"{int(stray.sum())} label px outside their own cell, e.g. grid "
+                     f"({xs[0] / S:.1f}, {ys[0] / S:.1f}) pt — the per-cell clip is gone")
+    return fails
+
+
+def grid_check(min_hidden=0, need_codes=(), min_micro=0, min_excluded=0,
+               min_forced=0, need_floor=False):
+    def chk(o):
+        job, d = o.case.job, o.design
+        nedre = job.get("ruta_nedre", False)
+        ph, cell = _grid_geometry(d, nedre, job.get("page_height_m"))
+        res = o.result
+        if res["grid_labeled_pdf"] is None:
+            return [f"grid_labeled_pdf is None but the labeler placed {o.rec.placed}"]
+        strip_side, hidden = [], 0
+        for st in o.strips:
+            s = st["num"] - 1
+            for p, t in probe.strip_labels(st["bytes"]):
+                c = cell(s, p)
+                if t["x"] >= c.width:           # under the partial page's pad (TIF-104)
+                    hidden += 1
+                strip_side.append((t["text"], c.x0 + t["x"], c.y0 + t["y"], t["size"],
+                                   t["color"], t["bbox"] + (c.x0, c.y0, c.x0, c.y0), c))
+        fails = _replay_parity(o.rec.placed, strip_side, res["grid_labeled_pdf"],
+                               res["grid_pdf"], ph)
+        # the fixture must exercise what it claims to
+        texts = {t[0] for t in strip_side}
+        if hidden < min_hidden:
+            fails.append(f"FIXTURE: {hidden} label(s) under a pad, need >= {min_hidden}")
+        if not set(need_codes) <= texts:
+            fails.append(f"FIXTURE: codes {sorted(set(need_codes) - texts)} never placed")
+        micro = sum(1 for t in strip_side if t[3] < 1.0)
+        if micro < min_micro:
+            fails.append(f"FIXTURE: {micro} label(s) under 1 pt, need >= {min_micro}")
+        if o.rec.forced < min_forced:
+            fails.append(f"FIXTURE: {o.rec.forced} forced placement(s), need >= {min_forced}")
+        if need_floor and not any(abs(t[3] - slicer.LABEL_FONT_TECH_MIN) < 1e-3
+                                  for t in strip_side):
+            fails.append(f"FIXTURE: no label at the {slicer.LABEL_FONT_TECH_MIN} pt floor")
+        npg = math.ceil(d.height_m / (job.get("page_height_m") or slicer.PAGE_HEIGHT_M))
+        excluded = sum(npg - len(st["pages"]) for st in o.strips)
+        if excluded < min_excluded:
+            fails.append(f"FIXTURE: {excluded} excluded page(s), need >= {min_excluded}")
+        return fails
+    return chk
+
+
+SHORT = ("S", "Vit", "1500", "3000", "3560")
+for nedre in (False, True):
+    # 13 m: a partial page at 4 and 6 m. Every config but default/6 m also has a
+    # page that is all pink in some strip (excluded); that one has none to give.
+    for ph_m, hidden in ((4.0, 1), (1.0, 0), (6.0, 1)):
+        add(Case(f"grid/labeled/{mode(nedre)}/ph{ph_m:g}",
+                 "TIF-95 HARD criterion: every label on every strip is on the labeled "
+                 "grid, at its translated position, same text/size/colour, counted "
+                 "three ways (labeler = strip spans = grid spans). Both rotation modes, "
+                 "non-default page heights, short numeric codes, micro labels, seam "
+                 "straddlers, an excluded page, a partial page",
+                 grid_fixture(),
+                 job=dict(via="job", colour_map=LABELS_104, ruta_nedre=nedre,
+                          page_height_m=ph_m),
+                 check=grid_check(min_hidden=hidden, need_codes=SHORT, min_micro=5,
+                                  min_excluded=0 if (not nedre and ph_m == 6.0) else 1,
+                                  # measured: default at 1 m yields a forced
+                                  # label at the 0.1 pt floor; hold it to that
+                                  min_forced=1 if (not nedre and ph_m == 1.0) else 0,
+                                  need_floor=not nedre and ph_m == 1.0)))
+
+for nedre in (False, True):
+    d = Design(1.5, 5.0).background(SKIP_PINK)
+    # Content everywhere; on the partial page (the last 1 m of the printing
+    # sequence) it ENDS in white, so that white and the page's blank area are one
+    # component (TIF-104's shape).
+    d.content_seq(4.6 * synth.PPM, GREY, nedre)
+    d.content_seq(5.0 * synth.PPM, WHITE, nedre, seq_start=4.6 * synth.PPM)
+    d.patch(10, (0.4 if nedre else 4.4) * synth.PPM, 8, 8, GREEN)
+    add(Case(f"grid/labeled/tif104-white-at-content-end/{mode(nedre)}",
+             "TIF-95 x TIF-104: white mapped, a partial page whose content ends in "
+             "white. The labeler also labels the blank area the pad later hides; those "
+             "labels are still replayed (parity holds) but clipped to their own cell, "
+             "so the grid shows them no more than the strip does",
+             d, job=dict(via="job", colour_map=LABELS_104, ruta_nedre=nedre),
+             check=grid_check(min_hidden=1, need_codes=("Vit",))))
+
+
+def _replay_handmade(o):
+    """The replay alone, on placements no labeler produces on demand: the 0.1 pt
+    technical floor, two forced labels on the same spot, labels flush with and
+    straddling the cell edges, one wholly past the content (pad-hidden)."""
+    d = Design(3.0, 6.0).background(GREY)
+    ph, cell = _grid_geometry(d, True, 4.0)
+    LP = slicer.LabelPlacement
+    c0, c1 = cell(0, 1), cell(1, 0)
+    labs = [LP(0, 0, 1, "S", 0.0, 0.1, 0.1, (0, 0, 0)),                # floor, corner
+            LP(0, 0, 1, "1500", 3.0, 5.0, 0.1, (1, 1, 1)),
+            LP(0, 0, 1, "1500", 3.0, 5.0, 0.1, (1, 1, 1)),              # forced twin
+            LP(0, 0, 1, "3000", c0.width - 1.0, 20.0, 3.0, (0, 0, 0)),  # straddles edge
+            LP(0, 0, 1, "Vit", c0.width + 5.0, 20.0, 3.0, (1, 1, 1)),   # hidden (pad)
+            LP(0, 1, 0, "3560", 1.0, c1.height, 2.0, (0, 0, 0)),        # bottom edge
+            LP(0, 1, 0, "S", 50.0, 20.0, 0.75, (0, 0, 0))]
+    plain, labeled = slicer.generate_grid_pdfs(d.pdf(), 3.0, 6.0, ruta_nedre=True,
+                                              page_height_m=4.0, labels=labs)
+    strip_side = []
+    for lab in labs:
+        c = cell(lab.strip, lab.page_num)
+        w = fitz.get_text_length(lab.text, fontsize=lab.fontsize)
+        bb = fitz.Rect(lab.x, lab.y - 1.075 * lab.fontsize, lab.x + w,
+                       lab.y + 0.3 * lab.fontsize)
+        strip_side.append((lab.text, c.x0 + lab.x, c.y0 + lab.y, lab.fontsize,
+                           tuple(float(v) for v in lab.color),
+                           bb + (c.x0, c.y0, c.x0, c.y0), c))
+    fails = _replay_parity(len(labs), strip_side, labeled, plain, ph)
+    if slicer.generate_grid_pdfs(d.pdf(), 3.0, 6.0, labels=[])[1] is not None:
+        fails.append("no placements must give no labeled grid")
+    return fails
+
+
+add(Case("grid/replay/handmade-placements",
+         "TIF-95: the replay keeps 0.1 pt floor labels, duplicate forced labels, "
+         "edge-flush and edge-straddling labels, and clips a pad-hidden one to its cell",
+         check=_replay_handmade))
+
+
+def grid_absent(o):
+    res, fails = o.result, []
+    if res["grid_labeled_pdf"] is not None:
+        fails.append("grid_labeled_pdf emitted for a job that placed no labels")
+    if not res["grid_pdf"]:
+        fails.append("grid_pdf missing")
+    if o.rec.placed:
+        fails.append(f"FIXTURE: the labeler placed {o.rec.placed} labels")
+    return fails
+
+
+add(Case("grid/absent/skip-colors",
+         "TIF-95 decision 1: a skip_colors job has no labels, so no labeled grid "
+         "(null): the UI shows only grid_pdf",
+         grid_fixture(), job=dict(via="job", colour_map=LABELS_104, skip_colors=True),
+         check=grid_absent),
+    Case("grid/absent/raster",
+         "TIF-95 decision 1: a raster job is never labeled, so no labeled grid",
+         raster("png"), job=dict(via="job", colour_map=RASTER_MAP), check=grid_absent),
+    Case("grid/absent/nothing-mapped",
+         "TIF-95 decision 1: a labeled job whose labeler places zero labels (no mapped "
+         "colour in the design) gets no labeled grid either",
+         klipp_design(8.0, 5.0 * synth.PPM, False),
+         job=dict(via="job", colour_map={SKIP_PINK: "Skip", GREEN: "3560"}),
+         check=grid_absent))
+
+
+def grid_reference(o):
+    """Rad/Ruta tidy: one line each, GRID_REF_FONT_SCALE-sized, GRID_REF_OPACITY,
+    inside the page, no two reference texts touching, a cell text in every cell
+    of at least 12 x 12 pt."""
+    fails = []
+    job, d = o.case.job, o.design
+    ph, cell = _grid_geometry(d, job.get("ruta_nedre", False), job.get("page_height_m"))
+    _labs, refs = probe.grid_texts(o.result["grid_pdf"])
+    page = fitz.Rect(0, 0, d.full_h, d.full_w)
+    for t in refs:
+        if not REF_TEXT.fullmatch(t["text"]):
+            fails.append(f"reference text {t['text']!r} is not one whole line")
+        if abs(t["opacity"] - slicer.GRID_REF_OPACITY) > 1e-3:
+            fails.append(f"{t['text']!r} opacity {t['opacity']}")
+        if t["size"] > 6 * slicer.GRID_REF_FONT_SCALE + 1e-3:
+            fails.append(f"{t['text']!r} at {t['size']:.2f} pt")
+        if not page.contains(t["bbox"]):
+            fails.append(f"{t['text']!r} leaves the page {t['bbox']}")
+    tight = [fitz.Rect(t["x"], t["y"] - 0.75 * t["size"],
+                       t["x"] + fitz.get_text_length(t["text"], fontsize=t["size"]),
+                       t["y"] + 0.25 * t["size"]) for t in refs]
+    for i in range(len(refs)):
+        for j in range(i + 1, len(refs)):
+            if tight[i].intersects(tight[j]):
+                fails.append(f"{refs[i]['text']!r} overlaps {refs[j]['text']!r}")
+    texts = {t["text"] for t in refs}
+    ns = math.ceil(d.width_m / slicer.STRIP_WIDTH_M)
+    npg = math.ceil(d.height_m / (job.get("page_height_m") or slicer.PAGE_HEIGHT_M))
+    for s in range(ns):
+        for p in range(npg):
+            c = cell(s, p)
+            if c.width >= 12 and c.height >= 12 and not (
+                    f"Rad {s + 1} / Ruta {p + 1}" in texts or f"R{s + 1}/R{p + 1}" in texts):
+                fails.append(f"cell Rad {s + 1}/Ruta {p + 1} ({c.width:.0f}x{c.height:.0f} "
+                             f"pt) has no reference text")
+    return fails
+
+
+for nedre, ph_m in ((False, 0.5), (True, 1.0), (False, 4.0)):
+    # Last strip 0.4 m: an 11.3 pt band, too thin for side label + cell text, so
+    # the side label must step aside or be dropped. (0.2 m would put the STRIP's
+    # own page number off its 5.7 pt page, a separate pre-existing limit.)
+    d = Design(3.4, 5.0).background(GREY)
+    add(Case(f"grid/reference/{mode(nedre)}/ph{ph_m:g}",
+             "TIF-95 tidy: Rad/Ruta reference text on ONE line, smaller and lighter, "
+             "never overlapping (side label and cell text collided at small page "
+             "heights before)",
+             d, job=dict(via="job", colour_map={}, ruta_nedre=nedre, page_height_m=ph_m),
+             check=grid_reference))

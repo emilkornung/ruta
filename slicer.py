@@ -8,6 +8,7 @@ standalone backup). This module contains only the PDF geometry logic.
 
 import io
 import math
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz  # pymupdf
@@ -30,7 +31,7 @@ STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
 SLICE_WORKERS = 6
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # Page scale for raster (JPG/PNG) sources — see image_to_pdf().
 #
@@ -857,11 +858,18 @@ def _label_colors_on_page(page, color_map, pn_excl=None):
         a zero-space cluster is visible in the summary rather than silent.
 
     Returns {code: {"count", "font_sizes", "rects", "placement", "forced",
-    "skipped_small"}} for inspection/validation ("rects" are glyph bboxes in
-    page points, aligned with "font_sizes"; "placement" entries are
-    "fit"/"forced"; "skipped_small" counts patches skipped under
+    "skipped_small", "placed", "text_color"}} for inspection/validation ("rects"
+    are glyph bboxes in page points, aligned with "font_sizes"; "placement"
+    entries are "fit"/"forced"; "skipped_small" counts patches skipped under
     MIN_LABEL_PATCH_SIZE_PT, TIF-69). Keyed by paint CODE (not hex) since
-    round 4. The slicing path ignores the return value.
+    round 4.
+
+    "placed" (TIF-95) is the EXACT record of what was drawn, one (seq, x, y,
+    fontsize) per label, aligned with "rects": the insert_text origin and size
+    as unrounded floats, and seq the label's draw order on this page.
+    "text_color" is the code's label colour. _slice_one_strip collects these and
+    generate_grid_pdfs replays them onto the labeled grid; "rects"/"font_sizes"
+    are rounded for reporting and must not be used for that.
     """
     summary = {}
 
@@ -932,7 +940,8 @@ def _label_colors_on_page(page, color_map, pn_excl=None):
     for npx, code, sl, sub_mask, dt, text_color in patches:
         entry = summary.setdefault(
             code, {"count": 0, "font_sizes": [], "rects": [], "placement": [],
-                   "forced": 0, "skipped_small": 0})
+                   "forced": 0, "skipped_small": 0, "placed": [],
+                   "text_color": text_color})
 
         r_pts = float(dt.max()) / S
 
@@ -1019,6 +1028,7 @@ def _label_colors_on_page(page, color_map, pn_excl=None):
         rect = fitz.Rect(ox - MARGIN, oy - hh - MARGIN, ox + tw + MARGIN, oy + MARGIN)
 
         page.insert_text(fitz.Point(ox, oy), code, fontsize=fs, color=text_color)
+        entry["placed"].append((len(placed_rects), ox, oy, fs))
         placed_rects.append(rect)
         entry["count"]      += 1
         entry["font_sizes"].append(round(fs, 2))
@@ -1048,13 +1058,33 @@ def extract_pdf_colors(pdf_bytes):
 
 # ── Core slicing ──────────────────────────────────────────────────────────────
 
+# One paint-code label as slice_one_strip drew it (TIF-95): which source page,
+# strip (0-based) and printing page (page_num, 0-based, NOT the index in the strip
+# PDF — excluded pages leave gaps), and the exact insert_text arguments in that
+# strip page's own coordinates. generate_grid_pdfs replays these onto the grid.
+LabelPlacement = namedtuple(
+    "LabelPlacement", "src_page strip page_num text x y fontsize color")
+
+
 def slice_one_strip(args):
+    """
+    The strip-slicing entry point the guards and harnesses call:
+    (strip_number, pdf_bytes). The work, and the full contract, live in
+    _slice_one_strip, which additionally returns the label placements.
+    """
+    strip_num, strip_bytes, _ = _slice_one_strip(args)
+    return strip_num, strip_bytes
+
+
+def _slice_one_strip(args):
     """
     Slice a single strip from the source PDF. Runs in a thread.
     Pages rotated 270° to landscape with correct left→right edge continuity.
     Fully pink pages are skipped but page numbers are preserved.
     Color labels are added PER STRIP PAGE after rendering (never cross slice boundaries).
-    Returns (strip_number, pdf_bytes).
+    Returns (strip_number, pdf_bytes, placements): placements is a list of
+    LabelPlacement, one per paint-code label drawn on this strip, in draw order
+    (TIF-95). Recording them changes nothing about what is drawn.
 
     color_map and skip_labels are INDEPENDENT (TIF-57 follow-up). The map has two
     consumers and they are not the same concern:
@@ -1085,6 +1115,7 @@ def slice_one_strip(args):
 
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc = fitz.open()
+    placements = []
 
     for src_page in src_doc:
         r       = src_page.rect
@@ -1159,8 +1190,17 @@ def slice_one_strip(args):
             # Gated on skip_labels, NOT on the map being empty: pass A above still
             # needs the real map even when no labels are to be printed.
             if color_map and not skip_labels:
-                _label_colors_on_page(new_page, color_map,
-                                      pn_excl=(pn_excl_w, pn_excl_y0, pn_excl_y1))
+                summary = _label_colors_on_page(
+                    new_page, color_map, pn_excl=(pn_excl_w, pn_excl_y0, pn_excl_y1))
+                # TIF-95: record every label exactly as drawn, for the labeled
+                # grid. Indexed, not .get(): a summary without "placed" must fail
+                # loudly, never replay as "no labels".
+                drawn = sorted((seq, code, x, y, fs, e["text_color"])
+                               for code, e in summary.items()
+                               for seq, x, y, fs in e["placed"])
+                placements.extend(
+                    LabelPlacement(src_page.number, s, page_num, code, x, y, fs, color)
+                    for _seq, code, x, y, fs, color in drawn)
 
             # Pink padding on a GEOMETRICALLY partial page — the source clip did
             # not cover the full output page, so pad_x (= content_w) onwards is
@@ -1298,12 +1338,17 @@ def slice_one_strip(args):
     out_doc.save(buf)
     out_doc.close()
     src_doc.close()
-    return (s + 1, buf.getvalue())
+    return (s + 1, buf.getvalue(), placements)
 
 
 def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False,
-               skip_labels=False, page_height_m=None):
-    """Slice pdf_bytes into vertical strips in parallel. Returns sorted list of (strip_num, bytes)."""
+               skip_labels=False, page_height_m=None, labels_out=None):
+    """Slice pdf_bytes into vertical strips in parallel. Returns sorted list of (strip_num, bytes).
+
+    labels_out (TIF-95), when given, is extended with every strip's
+    LabelPlacements, in strip order. The return value is unchanged so existing
+    callers are unaffected.
+    """
     page_height_m = PAGE_HEIGHT_M if page_height_m is None else page_height_m
     num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
     num_pages  = math.ceil(height_m / page_height_m)
@@ -1316,22 +1361,160 @@ def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False,
 
     results = {}
     with ThreadPoolExecutor(max_workers=SLICE_WORKERS) as pool:
-        futures = {pool.submit(slice_one_strip, a): a[0] for a in args}
+        futures = {pool.submit(_slice_one_strip, a): a[0] for a in args}
         for future in as_completed(futures):
-            strip_num, strip_bytes = future.result()
-            results[strip_num] = strip_bytes
+            strip_num, strip_bytes, placements = future.result()
+            results[strip_num] = (strip_bytes, placements)
             print(f"    Strip {strip_num}/{num_strips} sliced.")
 
-    return [(n, results[n]) for n in sorted(results)]
+    if labels_out is not None:
+        for n in sorted(results):
+            labels_out.extend(results[n][1])
+    return [(n, results[n][0]) for n in sorted(results)]
 
 
-def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False,
-                      page_height_m=None):
+# ── Grid overview ─────────────────────────────────────────────────────────────
+
+GRID_RED = (0.9, 0.1, 0.1)
+
+# Rad/Ruta reference text (TIF-95). It used to be full-opacity red at a size the
+# formulas below put at 6 pt for every real design (a 1.5 m strip is 42.5 pt, so
+# max(6, ...) always wins), laid out in a textbox that wrapped "Rad 1" onto two
+# lines and, at small page heights, ran the side label into the cell text. With
+# paint-code labels (<= LABEL_FONT_DEFAULT, 3 pt) now drawn on top, it is
+# secondary reference: same formulas scaled by GRID_REF_FONT_SCALE (6 -> 2.7 pt),
+# at GRID_REF_OPACITY, always ONE line, never overlapping. Applies to both grids.
+GRID_REF_FONT_SCALE = 0.45  # x the old size: 2.7 pt at 1:100 (chosen over 3.6 pt / 0.45 in review)
+GRID_REF_OPACITY    = 0.30  # fill opacity of all Rad/Ruta text
+GRID_REF_MIN_FONT_PT = 1.0  # a reference text that only fits below this is left out
+GRID_CELL_PAD_PT    = 4.0   # inset of the cell text from its cell (as before)
+GRID_SIDE_PAD_PT    = 2.0   # inset of the "Rad s" side label from the grid's left edge (as before)
+GRID_REF_GAP_PT     = 1.0   # minimum vertical clearance between side label and cell text
+
+
+def _fit_one_line(texts, fontsize, avail_w):
+    """First of `texts` that fits avail_w on one line at fontsize, else the last
+    shrunk to fit. Returns (text, fontsize, width), or None below
+    GRID_REF_MIN_FONT_PT."""
+    for t in texts:
+        w = fitz.get_text_length(t, fontname="helv", fontsize=fontsize)
+        if w <= avail_w:
+            return t, fontsize, w
+    t = texts[-1]
+    fs = fontsize * avail_w / fitz.get_text_length(t, fontname="helv", fontsize=fontsize)
+    if fs < GRID_REF_MIN_FONT_PT:
+        return None
+    return t, fs, fitz.get_text_length(t, fontname="helv", fontsize=fs)
+
+
+def _draw_grid_reference(page, num_strips, num_pages, strip_band, page_h_pts, full_h):
+    """Rad/Ruta reference text, one Shape for the whole page (TIF-95 layout).
+
+    Cell text: "Rad s / Ruta p" (or "Rs/Rp" when that does not fit, shrunk if
+    even that does not), one line, centred, top of the cell. Side label "Rad s":
+    one line at the grid's left edge, centred on the strip's band, pushed below
+    the first cell's text when they would touch, dropped when the band is too
+    thin for both (every cell text already names its Rad)."""
+    shape = page.new_shape()
+
+    def put(x, base, text, fs):
+        shape.insert_text(fitz.Point(x, base), text, fontsize=fs, color=GRID_RED,
+                          fill_opacity=GRID_REF_OPACITY)
+
+    for s in range(num_strips):
+        ny0, ny1 = strip_band(s)
+        cell_w = ny1 - ny0
+        first_cell_bottom, first_cell_x0 = None, None
+
+        for page_num in range(num_pages):
+            nx0 = page_num * page_h_pts
+            nx1 = min((page_num + 1) * page_h_pts, full_h)
+            cell_h = nx1 - nx0
+            fs = max(6, min(24, min(cell_w, cell_h) / 10)) * GRID_REF_FONT_SCALE
+            fit = _fit_one_line([f"Rad {s + 1} / Ruta {page_num + 1}",
+                                 f"R{s + 1}/R{page_num + 1}"],
+                                fs, cell_h - 2 * GRID_CELL_PAD_PT)
+            if fit is None:
+                continue
+            text, fs, w = fit
+            base = ny0 + GRID_CELL_PAD_PT + fs
+            if base + 0.25 * fs > ny1 - GRID_CELL_PAD_PT:
+                continue
+            x = nx0 + (cell_h - w) / 2
+            put(x, base, text, fs)
+            if page_num == 0:
+                first_cell_bottom, first_cell_x0 = base + 0.25 * fs, x
+
+        top_fs = max(6, min(14, cell_w / 8)) * GRID_REF_FONT_SCALE
+        first_w = min(page_h_pts, full_h) - 2 * GRID_SIDE_PAD_PT
+        fit = _fit_one_line([f"Rad {s + 1}"], top_fs, first_w)
+        if fit is None:
+            continue
+        text, top_fs, w = fit
+        base = (ny0 + ny1) / 2 + 0.35 * top_fs
+        clear_left = (first_cell_x0 is None
+                      or GRID_SIDE_PAD_PT + w + GRID_REF_GAP_PT <= first_cell_x0)
+        if not clear_left and base - 0.8 * top_fs < first_cell_bottom + GRID_REF_GAP_PT:
+            base = first_cell_bottom + GRID_REF_GAP_PT + 0.8 * top_fs
+        if base + 0.25 * top_fs > ny1 - GRID_SIDE_PAD_PT:
+            continue
+        put(GRID_SIDE_PAD_PT, base, text, top_fs)
+
+    shape.commit()
+
+
+def _replay_labels(page, cell_rect, labels):
+    """Draw the strips' paint-code labels onto one grid page (TIF-95).
+
+    The grid is the source rendered at the strips' own scale, and every strip
+    page is a pure translation of its grid cell (verified pixel-for-pixel in
+    both rotation modes and at 1.0-6.0 m page heights): strip-page point (x, y)
+    is grid point cell.top_left + (x, y). So each label is redrawn with the
+    exact text, size, colour and origin the strip used, offset to its cell.
+
+    Each cell's labels go through a Form XObject whose bounding box IS the cell,
+    so a label is clipped to its own cell. TEMPORARY WORKAROUND for TIF-104: on
+    a partial page the labeler runs before the pink pad is drawn, so when white
+    is mapped it labels the blank area, and the pad then hides that label on the
+    strip. It is still replayed (strict parity: labeler = strip spans = grid
+    spans), and the clip keeps it as invisible on the grid as on the strip.
+    Remove the clip, not the replay, once TIF-104 stops those labels existing.
     """
-    Generate a rotated grid overview that matches the sliced strips.
+    by_cell = {}
+    for lab in labels:
+        by_cell.setdefault((lab.strip, lab.page_num), []).append(lab)
+    # All cell pages are built before any is shown: show_pdf_page caches a graft
+    # map of its source, and a page added to the source after the first graft
+    # fails with "source object number out of range".
+    tmp = fitz.open()
+    cells = []
+    for (s, page_num), labs in by_cell.items():
+        rect = cell_rect(s, page_num)
+        cell = tmp.new_page(width=rect.width, height=rect.height)
+        shape = cell.new_shape()
+        for lab in labs:
+            shape.insert_text(fitz.Point(lab.x, lab.y), lab.text,
+                              fontsize=lab.fontsize, color=lab.color)
+        shape.commit()
+        cells.append((rect, cell.number))
+    for rect, n in cells:
+        page.show_pdf_page(rect, tmp, n)
+    tmp.close()
 
-    Default (ruta_nedre=False): rotate=270, bottom→top page numbering. UNCHANGED
-    and byte-identical to before.
+
+def generate_grid_pdfs(pdf_bytes, width_m, height_m, ruta_nedre=False,
+                       page_height_m=None, labels=None):
+    """
+    Generate the rotated grid overview that matches the sliced strips, and the
+    labeled grid (TIF-95): the SAME document with the strips' paint-code labels
+    drawn on top. Returns (grid_bytes, labeled_bytes); labeled_bytes is None
+    when `labels` (LabelPlacements from _slice_one_strip) is empty or None.
+
+    The labeled grid is the unlabeled grid's document, saved, then labeled and
+    saved again: "the grid as today, with labels on top" by construction, and the
+    source is rendered once.
+
+    Default (ruta_nedre=False): rotate=270, bottom→top page numbering.
 
     ruta_nedre=True: rotate=90 to match the strips (top→bottom page flow). This
     keeps the design-y→grid-x direction increasing so "Ruta 1" still labels the
@@ -1347,6 +1530,7 @@ def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False,
     out_doc    = fitz.open()
     num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
     num_pages  = math.ceil(height_m / page_height_m)
+    cell_rects = []
 
     for src_page in src_doc:
         r       = src_page.rect
@@ -1358,12 +1542,21 @@ def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False,
         # Grid-y band [ny0, ny1] occupied by strip s. rotate=90 flips design-x→y
         # so for ruta_nedre the band is mirrored about full_w (keeps the label on
         # the strip's actual content); Rad numbering itself is unchanged.
-        def strip_band(s):
+        def strip_band(s, strip_w_pts=strip_w_pts, full_w=full_w):
             x0s = s * strip_w_pts
             x1s = min((s + 1) * strip_w_pts, full_w)
             if ruta_nedre:
                 return (full_w - x1s, full_w - x0s)
             return (x0s, x1s)
+
+        # Strip s, page page_num on the grid: exactly the part of the strip page
+        # that shows the design (a partial page's pad lies past the grid's edge).
+        def cell_rect(s, page_num, strip_band=strip_band, page_h_pts=page_h_pts,
+                      full_h=full_h):
+            ny0, ny1 = strip_band(s)
+            return fitz.Rect(page_num * page_h_pts, ny0,
+                             min((page_num + 1) * page_h_pts, full_h), ny1)
+        cell_rects.append(cell_rect)
 
         new_page = out_doc.new_page(width=full_h, height=full_w)
         new_page.show_pdf_page(new_page.rect, src_doc, src_page.number,
@@ -1373,51 +1566,42 @@ def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False,
         for k in range(1, num_pages):
             nx = k * page_h_pts
             shape.draw_line(fitz.Point(nx, 0), fitz.Point(nx, full_w))
-        shape.finish(color=(0.9, 0.1, 0.1), width=1.5, stroke_opacity=0.6)
+        shape.finish(color=GRID_RED, width=1.5, stroke_opacity=0.6)
         shape.commit()
 
         shape = new_page.new_shape()
         for s in range(1, num_strips):
             ny = (full_w - s * strip_w_pts) if ruta_nedre else (s * strip_w_pts)
             shape.draw_line(fitz.Point(0, ny), fitz.Point(full_h, ny))
-        shape.finish(color=(0.9, 0.1, 0.1), width=1.5, stroke_opacity=0.6)
+        shape.finish(color=GRID_RED, width=1.5, stroke_opacity=0.6)
         shape.commit()
 
-        for s in range(num_strips):
-            ny0, ny1 = strip_band(s)
-            cell_w = ny1 - ny0
-            top_fs = max(6, min(14, cell_w / 8))
-
-            # Guard against degenerate rect on very narrow partial strips
-            label_rect = fitz.Rect(2, ny0 + 2, 2 + top_fs + 4, ny1 - 2)
-            if label_rect.is_valid and label_rect.width > 2 and label_rect.height > 2:
-                new_page.insert_textbox(
-                    label_rect,
-                    f"Rad {s + 1}", fontsize=top_fs, color=(0.9, 0.1, 0.1), align=1)
-
-            for page_num in range(num_pages):
-                nx0 = page_num * page_h_pts
-                nx1 = min((page_num + 1) * page_h_pts, full_h)
-                cell_h = nx1 - nx0
-                fs = max(6, min(24, min(cell_w, cell_h) / 10))
-
-                cell_rect = fitz.Rect(nx0 + 4, ny0 + 4, nx1 - 4, ny1 - 4)
-                if cell_rect.is_valid and cell_rect.width > 2 and cell_rect.height > 2:
-                    rc = new_page.insert_textbox(
-                        cell_rect,
-                        f"Rad {s + 1} / Ruta {page_num + 1}",
-                        fontsize=fs, color=(0.9, 0.1, 0.1), align=1)
-                    if rc < 0:
-                        new_page.insert_text(
-                            fitz.Point(nx0 + 2, ny0 + fs + 2),
-                            f"R{s + 1}/R{page_num + 1}",
-                            fontsize=max(5, fs * 0.7), color=(0.9, 0.1, 0.1))
+        _draw_grid_reference(new_page, num_strips, num_pages, strip_band,
+                             page_h_pts, full_h)
 
     buf = io.BytesIO()
     out_doc.save(buf)
+    grid_bytes = buf.getvalue()
+
+    labeled_bytes = None
+    if labels:
+        for page in out_doc:
+            _replay_labels(page, cell_rects[page.number],
+                           [lab for lab in labels if lab.src_page == page.number])
+        buf = io.BytesIO()
+        out_doc.save(buf)
+        labeled_bytes = buf.getvalue()
+
     out_doc.close()
     src_doc.close()
-    return buf.getvalue()
+    return grid_bytes, labeled_bytes
+
+
+def generate_grid_pdf(pdf_bytes, width_m, height_m, ruta_nedre=False,
+                      page_height_m=None):
+    """The unlabeled grid alone — see generate_grid_pdfs."""
+    return generate_grid_pdfs(pdf_bytes, width_m, height_m, ruta_nedre=ruta_nedre,
+                              page_height_m=page_height_m)[0]
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -1480,6 +1664,10 @@ def run_slice(
                                              # LABELS off, or a raster source, which
                                              # is never labeled) — so [] is not
                                              # misread as "every colour matched"
+        "grid_pdf": b"...",                  # the grid overview
+        "grid_labeled_pdf": b"..." | None,   # the same grid with every strip's
+                                             # paint-code labels on top (TIF-95);
+                                             # None when no label was placed
     }
     """
     # Raster preprocessing runs FIRST, so every stage below — banderoll rotation
@@ -1556,18 +1744,25 @@ def run_slice(
         # every tolerance band); every mapped color still gets its label.
         unknown_colors = find_unknown_colors(hex_colors, color_map)
 
+    placements = []
     strips_raw = _slice_pdf(pdf_bytes, width_m, height_m, color_map,
                             ruta_nedre=ruta_nedre, skip_labels=effective_skip,
-                            page_height_m=page_height_m)
+                            page_height_m=page_height_m, labels_out=placements)
 
     strips = [
         {"filename": f"strip-{strip_num:02d}.pdf", "bytes": strip_bytes}
         for strip_num, strip_bytes in strips_raw
     ]
 
-    grid_bytes = generate_grid_pdf(pdf_bytes, width_m, height_m,
-                                   ruta_nedre=ruta_nedre,
-                                   page_height_m=page_height_m)
+    # TIF-95: the labeled grid exists iff at least one paint-code label was
+    # actually placed on a strip. effective_skip jobs (skip_colors, raster,
+    # labels disabled) never run the labeler, so they have none; a labeled job
+    # whose labeler placed nothing (no mapped colour on any rendered page) has
+    # none either, and its labeled grid would only repeat the plain one.
+    grid_bytes, grid_labeled_bytes = generate_grid_pdfs(
+        pdf_bytes, width_m, height_m, ruta_nedre=ruta_nedre,
+        page_height_m=page_height_m, labels=placements)
 
     return {"strips": strips, "unknown_colors": unknown_colors,
-            "grid_pdf": grid_bytes, "colors_analyzed": colors_analyzed}
+            "grid_pdf": grid_bytes, "grid_labeled_pdf": grid_labeled_bytes,
+            "colors_analyzed": colors_analyzed}

@@ -76,10 +76,14 @@ Response (JSON):
       "data": "<base64-encoded PDF bytes>"
     }
   ],
+  "grid_pdf": "<base64-encoded PDF bytes>",
+  "grid_labeled_pdf": "<base64-encoded PDF bytes>" | null,
   "unknown_colors": ["#RRGGBB"],
   "colors_analyzed": true
 }
 ```
+
+`grid_pdf` is the grid overview: the whole design with the Rad/Ruta grid on top. `grid_labeled_pdf` (added 1.7.0, TIF-95) is the same grid with every paint-code label from the strips drawn on top, in exactly the place, size and colour each strip carries it. It is `null` when the job placed no labels at all: `skip_colors`, raster uploads, or a design with no mapped colour. Show only `grid_pdf` then.
 
 `unknown_colors` lists the design colours that **no** `colour_map` entry claims — i.e. whose nearest mapped colour is further away than `COLOR_MATCH_TOLERANCE`. It is empty when colour labeling is skipped or every colour matches an entry.
 
