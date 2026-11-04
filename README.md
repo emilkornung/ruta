@@ -137,4 +137,4 @@ The real test designs (`kenta.pdf`, `ENAD_rutor.pdf`, `pest mitten 24x31,5m.pdf`
 
 ## Relation to ruta.py
 
-`ruta.py` (kept separately in `Ruta_New/`) is the original standalone script that polls Gmail, downloads PDF attachments, slices them, uploads strips to Google Drive, and labels processed threads. It is the authoritative backup and is **not modified** by this service. `slicer.py` is an extraction of the PDF geometry logic only — no Google API code.
+`ruta.py` was the original standalone script that polled Gmail, downloaded PDF attachments, sliced them, uploaded strips to Google Drive, and labeled processed threads. It and the Gmail pipeline are retired and are not part of this repo. `slicer.py` is an extraction of the PDF geometry logic only — no Google API code.

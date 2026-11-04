@@ -12,7 +12,7 @@
 ## What this repo is
 
 - The Railway slicer API: FastAPI in `api.py`, PDF/raster slicing in `slicer.py`. Deployed via `Procfile` (`uvicorn api:app`).
-- `ruta.py` and the Gmail pipeline are **not in this repo**. The README says the script is kept separately in `Ruta_New/`; `slicer.py` is only its geometry extraction. `color_map.json` is a legacy file the code no longer loads. Do not add Gmail, Drive or OAuth code here.
+- `ruta.py` and the Gmail pipeline are **not in this repo**. They are retired; `slicer.py` is only the geometry extraction of the old script. `color_map.json` is a legacy file the code no longer loads. Do not add Gmail, Drive or OAuth code here.
 - Windows environment: use PowerShell, and set `PYTHONIOENCODING=utf-8` when running scripts that print non-ASCII.
 
 ## Stateless, no secrets
