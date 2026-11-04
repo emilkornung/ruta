@@ -8,3 +8,9 @@ __pycache__/
 validation/
 raster_test/
 tif87_out/
+
+# Real test designs read by run_guards.py --real/--enad (kept locally, never committed)
+/kenta.pdf
+/ENAD_rutor.pdf
+/pest mitten 24x31,5m.pdf
+/pest övre 8x24m.pdf

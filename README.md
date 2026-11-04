@@ -119,7 +119,7 @@ curl -X POST http://localhost:8000/slice \
    web: uvicorn api:app --host 0.0.0.0 --port $PORT
    ```
 5. Railway injects `$PORT` automatically — no manual config needed.
-6. No colour-map file is needed in production: the caller sends the map in the `/slice` payload (sourced from the Supabase `colour_map` table). The local `color_map.json` is retired and used only by the standalone `ruta.py` Gmail script.
+6. No colour-map file is needed in production: the caller sends the map in the `/slice` payload (sourced from the Supabase `colour_map` table). The local `color_map.json` is retired: no code in this repo loads it. It is kept only as a reference table of known colours (several validation scripts mention it in comments).
 
 ## File layout
 
@@ -127,11 +127,13 @@ curl -X POST http://localhost:8000/slice \
 hammaby-ruta-api/
 ├── api.py           # FastAPI app — HTTP layer only
 ├── slicer.py        # Core PDF slicing logic
-├── color_map.json   # Legacy hex → colour-code map; used only by ruta.py, not the API
+├── color_map.json   # Legacy hex → colour-code reference table; not loaded by any code
 ├── requirements.txt
 ├── Procfile         # Railway start command
 └── .gitignore
 ```
+
+The real test designs (`kenta.pdf`, `ENAD_rutor.pdf`, `pest mitten 24x31,5m.pdf`, `pest övre 8x24m.pdf`) are kept locally in the repo root and are gitignored. `run_guards.py --real` / `--enad` read them from there and report a missing file as skipped. Never commit them.
 
 ## Relation to ruta.py
 
