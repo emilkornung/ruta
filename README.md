@@ -13,7 +13,7 @@ Accepts a PDF, JPG or PNG upload together with the physical dimensions (width ×
 - Pink partial-page padding with a dotted cut line and "Klipp" label
 - Banderoll mode: rotates a landscape source PDF 90° before slicing
 - Per-page colour code labels, enabled in production via `ENABLE_COLOR_LABELS`
-- Parallel strip generation
+- Parallel strip generation in a process pool (see [Strip workers](#strip-workers))
 
 ## Run locally
 
@@ -120,6 +120,19 @@ curl -X POST http://localhost:8000/slice \
    ```
 5. Railway injects `$PORT` automatically — no manual config needed.
 6. No colour-map file is needed in production: the caller sends the map in the `/slice` payload (sourced from the Supabase `colour_map` table). The local `color_map.json` is retired: no code in this repo loads it. It is kept only as a reference table of known colours (several validation scripts mention it in comments).
+
+### Strip workers
+
+Strips are sliced in parallel in a pool of worker **processes** (TIF-111). Threads gave no speedup: the work is serialized on Python's GIL. The pool uses the `spawn` start method on every platform and is created per job, so its memory is returned when the job ends.
+
+The number of workers is the smallest of:
+
+- `SLICE_WORKERS`, default 6, overridable with the environment variable `RUTA_SLICE_WORKERS` (not a secret);
+- the CPUs the container may use (affinity, capped by the cgroup CPU quota);
+- the number of strips;
+- what fits in `MEM_BUDGET_FRACTION` (70%) of the container's cgroup memory limit, at the per-worker estimate from `strip_mem_estimate()`.
+
+One worker means the strips run in-process with no pool. Each job logs its choice, for example `Slice pool: 2 worker(s) for 40 strip(s) (cap 6, cpus 2, mem limit 8192 MB, est 310 MB/worker, mem fits 18)`.
 
 ## File layout
 

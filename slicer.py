@@ -6,10 +6,14 @@ All Gmail, Drive, OAuth, and email-parsing code lives in ruta.py (the
 standalone backup). This module contains only the PDF geometry logic.
 """
 
+import contextlib
 import io
 import math
+import multiprocessing
+import os
+import sys
 from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import fitz  # pymupdf
 import numpy as np
@@ -29,9 +33,30 @@ from scipy import ndimage
 # passing it (or leaving it defaulted) must reproduce master's output exactly.
 STRIP_WIDTH_M = 1.5
 PAGE_HEIGHT_M = 4.0
-SLICE_WORKERS = 6
 
-VERSION = "1.7.0"
+
+def _env_int(name, default):
+    """A positive int from the environment, or `default` (with a note) when unset
+    or malformed. Not a secret: a tuning knob for the strip pool (TIF-111)."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        val = int(raw)
+        if val >= 1:
+            return val
+    except ValueError:
+        pass
+    print(f"    NOTE: ignoring {name}={raw!r} (not a positive integer); using {default}.")
+    return default
+
+
+# Upper CAP on parallel strip workers (TIF-111). The count actually used is the
+# smallest of this, the CPUs the container really has, a memory budget and the
+# strip count — see slice_workers(). Override with RUTA_SLICE_WORKERS.
+SLICE_WORKERS = _env_int("RUTA_SLICE_WORKERS", 6)
+
+VERSION = "1.8.0"
 
 # Page scale for raster (JPG/PNG) sources — see image_to_pdf().
 #
@@ -1341,31 +1366,201 @@ def _slice_one_strip(args):
     return (s + 1, buf.getvalue(), placements)
 
 
+# ── Strip worker pool (TIF-111) ───────────────────────────────────────────────
+#
+# Memory model for one strip worker, used to cap the worker count. The peak is
+# the whole-strip-column scan in _find_cut_boundary (TIF-100's finding): a
+# LABEL_RENDER_SCALE render of the column, its int32 copy, and one int64
+# distance plane per colour-map rep in _background_mask's np.stack. Calibrated
+# against measured worker peaks (see the TIF-111 report).
+WORKER_BASE_MB        = 250    # interpreter + pymupdf + numpy + scipy, idle worker
+WORKER_BYTES_PER_PX   = 64     # per column pixel, independent of the map
+WORKER_BYTES_PER_REP  = 16     # per column pixel, per colour-map rep
+MEM_BUDGET_FRACTION   = 0.70   # share of the container memory limit the pool may plan for
+
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def available_cpus(cgroup_root=None):
+    """CPUs this process may really use: the affinity set (os.cpu_count() counts
+    the HOST's CPUs inside a container), further capped by a cgroup CPU quota
+    (v2 cpu.max, else v1 cfs_quota/period), rounded down, at least 1."""
+    root = CGROUP_ROOT if cgroup_root is None else cgroup_root
+    if hasattr(os, "sched_getaffinity"):
+        n = len(os.sched_getaffinity(0))
+    else:
+        n = os.cpu_count() or 1
+    quota = None
+    try:
+        v2 = _read_text(os.path.join(root, "cpu.max"))
+        if v2:
+            q, _, p = v2.partition(" ")
+            if q != "max" and p:
+                quota = int(q) / int(p)
+        else:
+            q = _read_text(os.path.join(root, "cpu", "cpu.cfs_quota_us"))
+            p = _read_text(os.path.join(root, "cpu", "cpu.cfs_period_us"))
+            if q and p and int(q) > 0:
+                quota = int(q) / int(p)
+    except ValueError:
+        quota = None
+    if quota:
+        n = min(n, max(1, int(quota)))
+    return max(1, n)
+
+
+def memory_limit_bytes(cgroup_root=None):
+    """The container's memory limit (cgroup v2 memory.max, else v1
+    limit_in_bytes), or None when there is none (local machines, Windows)."""
+    root = CGROUP_ROOT if cgroup_root is None else cgroup_root
+    for rel in ("memory.max", os.path.join("memory", "memory.limit_in_bytes")):
+        raw = _read_text(os.path.join(root, rel))
+        if raw is None or raw == "max":
+            continue
+        try:
+            val = int(raw)
+        except ValueError:
+            continue
+        if 0 < val < 2 ** 60:          # v1 reports "unlimited" as ~2**63
+            return val
+    return None
+
+
+def _current_rss_bytes():
+    """This process's resident memory on Linux, else 0 (only used to leave room
+    for the parent when planning the pool)."""
+    raw = _read_text("/proc/self/statm")
+    if raw:
+        try:
+            return int(raw.split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except (ValueError, IndexError, OSError, AttributeError):
+            pass
+    return 0
+
+
+def strip_mem_estimate(pdf_bytes, width_m, color_map):
+    """Planned peak bytes of ONE strip worker for this job (see the model above):
+    base + the source it holds + the column scan of its widest strip."""
+    reps = len(_map_reps(color_map or {}))
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        col_px = 0
+        for page in doc:
+            r = page.rect
+            strip_w = min(STRIP_WIDTH_M * r.width / width_m, r.width)
+            col_px = max(col_px, math.ceil(r.height * LABEL_RENDER_SCALE)
+                         * math.ceil(strip_w * LABEL_RENDER_SCALE))
+    finally:
+        doc.close()
+    return (WORKER_BASE_MB * 2 ** 20 + 3 * len(pdf_bytes)
+            + col_px * (WORKER_BYTES_PER_PX + WORKER_BYTES_PER_REP * reps))
+
+
+def slice_workers(num_strips, est_bytes=None, cgroup_root=None, log=True):
+    """How many strip workers this job gets: the smallest of SLICE_WORKERS (the
+    cap, RUTA_SLICE_WORKERS), the usable CPUs, the strip count and what the
+    memory budget fits. 1 means in-process, no pool."""
+    cpus  = available_cpus(cgroup_root)
+    limit = memory_limit_bytes(cgroup_root)
+    n = max(1, min(SLICE_WORKERS, cpus, num_strips))
+    mem_fit = None
+    if limit and est_bytes:
+        budget  = limit * MEM_BUDGET_FRACTION - _current_rss_bytes()
+        mem_fit = max(1, int(budget // est_bytes))
+        n = min(n, mem_fit)
+    if log:
+        mb = lambda b: "none" if not b else f"{b / 2 ** 20:.0f} MB"
+        print(f"    Slice pool: {n} worker(s) for {num_strips} strip(s) "
+              f"(cap {SLICE_WORKERS}, cpus {cpus}, mem limit {mb(limit)}, "
+              f"est {mb(est_bytes)}/worker, mem fits {mem_fit if mem_fit else '-'})")
+    return n
+
+
+# Per-worker copy of the job (everything but the strip index), set once by the
+# pool initializer so the source PDF is pickled once per worker, not per strip.
+_WORKER_JOB = None
+
+
+def _pool_init(job):
+    global _WORKER_JOB
+    _WORKER_JOB = job
+
+
+def _pool_strip(s):
+    """Run in a worker: one strip, with its printed lines captured and returned
+    so the parent emits them (a spawned worker's stdout is not the caller's)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        strip_num, strip_bytes, placements = _slice_one_strip((s,) + _WORKER_JOB)
+    return strip_num, strip_bytes, placements, buf.getvalue()
+
+
 def _slice_pdf(pdf_bytes, width_m, height_m, color_map=None, ruta_nedre=False,
-               skip_labels=False, page_height_m=None, labels_out=None):
+               skip_labels=False, page_height_m=None, labels_out=None,
+               workers=None):
     """Slice pdf_bytes into vertical strips in parallel. Returns sorted list of (strip_num, bytes).
 
     labels_out (TIF-95), when given, is extended with every strip's
     LabelPlacements, in strip order. The return value is unchanged so existing
     callers are unaffected.
+
+    workers (TIF-111): None picks the count with slice_workers(); an explicit
+    int forces it (1 = in-process). Output is identical either way.
     """
     page_height_m = PAGE_HEIGHT_M if page_height_m is None else page_height_m
     num_strips = math.ceil(width_m  / STRIP_WIDTH_M)
     num_pages  = math.ceil(height_m / page_height_m)
 
-    args = [
-        (s, pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {},
-         ruta_nedre, skip_labels, page_height_m)
-        for s in range(num_strips)
-    ]
+    # Everything in _slice_one_strip's argument tuple except the strip index. The
+    # tuple layout is _slice_one_strip's, unchanged; workers prepend `s`.
+    job = (pdf_bytes, width_m, height_m, num_strips, num_pages, color_map or {},
+           ruta_nedre, skip_labels, page_height_m)
+
+    if workers is None:
+        workers = slice_workers(num_strips,
+                                strip_mem_estimate(pdf_bytes, width_m, color_map))
 
     results = {}
-    with ThreadPoolExecutor(max_workers=SLICE_WORKERS) as pool:
-        futures = {pool.submit(_slice_one_strip, a): a[0] for a in args}
-        for future in as_completed(futures):
-            strip_num, strip_bytes, placements = future.result()
+    if workers <= 1:
+        # In-process, strip by strip. Same function, same output as the pool; it
+        # is the path a 1-vCPU container, a single-strip job, and the guards
+        # (which monkeypatch this module, invisible to a spawned worker) take.
+        for s in range(num_strips):
+            strip_num, strip_bytes, placements = _slice_one_strip((s,) + job)
             results[strip_num] = (strip_bytes, placements)
             print(f"    Strip {strip_num}/{num_strips} sliced.")
+    else:
+        # TIF-111: PROCESSES, not threads. The old ThreadPoolExecutor gave no
+        # speedup at all (pest-ovre 14.7 s at 1 and at 8 threads): the work is
+        # serialized on the GIL. "spawn" on every platform, not Linux's fork:
+        # forking a running uvicorn process (event loop, threads, MuPDF state) is
+        # unsafe, and spawn is also what Windows does, so local tests exercise
+        # the production path. Startup measured at ~1 s per job, any worker
+        # count; one pool per job, so its memory is returned when the job ends.
+        pool = ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+            initializer=_pool_init, initargs=(job,))
+        try:
+            futures = [pool.submit(_pool_strip, s) for s in range(num_strips)]
+            for future in as_completed(futures):
+                strip_num, strip_bytes, placements, out = future.result()
+                if out:
+                    sys.stdout.write(out)  # the strip's own WARNING/NOTE lines
+                results[strip_num] = (strip_bytes, placements)
+                print(f"    Strip {strip_num}/{num_strips} sliced.")
+        finally:
+            # On a failure (an exception in a strip, or a worker killed, e.g. by
+            # the OOM killer -> BrokenProcessPool) drop the queued strips and
+            # reap every worker: none outlive the job.
+            pool.shutdown(wait=True, cancel_futures=True)
 
     if labels_out is not None:
         for n in sorted(results):

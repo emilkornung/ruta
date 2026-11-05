@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.8.0 — 2026-11-05
+
+**Strips are now sliced in a pool of worker processes instead of threads (TIF-111, part 1). Output is unchanged; large jobs are about 4× faster on 6 cores.**
+
+- **Why.** Production jobs of 60×16 m and 60×60 m took 7.7 and 14.6 min on Railway, while the caller gives up at about 295 s (`POST /slice 499`). The old `ThreadPoolExecutor` gave no speedup at all: pest-ovre took 14.7 s at 1 thread and at 8, because the work is serialized on Python's GIL.
+- **How.** `_slice_pdf` runs `_slice_one_strip`, unchanged, in a `ProcessPoolExecutor` with the `spawn` start method on every platform. Fork is not used: forking a running uvicorn process is unsafe, and spawn is what Windows does, so local tests exercise the production path. There is one pool per job: it starts in about 1 s, and its memory is returned when the job ends. The source PDF reaches each worker once, through the pool initializer. Each strip's printed lines (`WARNING`, `NOTE`) are captured in the worker and printed by the parent.
+- **Worker count** (`slice_workers()`): the smallest of `SLICE_WORKERS` (6, env `RUTA_SLICE_WORKERS`), the usable CPUs (affinity, capped by the cgroup CPU quota), the strip count, and what fits in 70% of the cgroup memory limit at `strip_mem_estimate()` per worker. The estimate models TIF-100's per-strip column scan, so a job that would not fit twice runs in-process. One worker means in-process, with no pool. Every job logs its choice as a `Slice pool:` line.
+- **Failures.** An exception in a strip, or a worker killed (for example by the OOM killer, which raises `BrokenProcessPool`), cancels the queued strips and reaps every worker. Tested by killing a worker mid-job: the job raised within seconds and no process was left.
+- **Unchanged:** `_slice_one_strip` and the protected rotation block. Strips, `grid_pdf` and `grid_labeled_pdf` are pixel-identical to 1.7.0 on pest-ovre (1, 2, 4, 6 and 8 workers), kenta and pest-mitten (`ruta_nedre`), and through uvicorn. The bytes differ only by the trailer `/ID`, which is random per save.
+- **Measured** (Ryzen 7 3700X, 16 threads, Windows; 1.7.0 threads → 1.8.0 pool at 6 workers): pest-ovre 14.7 → 6.7 s, kenta 12.1 → 6.2 s, pest-mitten 94.9 → 23.4 s. Peak memory per worker was 107–121 MB against an estimate of 284–329 MB.
+- **Guards:** `probe.drive_job` runs in-process (`SLICE_WORKERS=1`), because the sweep's patches are invisible to spawned workers. New synthetic cases: `pool/identical-to-inline` (a real 2-worker pool against in-process: strips, label placements and NOTE lines; checked to fail when the NOTE relay is broken) and `pool/worker-count` (cgroup v1/v2 CPU and memory parsing, the cap, the strip count, the memory budget, and the environment override).
+
 ## 1.7.0 — 2026-10-25
 
 **New: a colour-labeled grid overview, `grid_labeled_pdf`, next to the existing `grid_pdf` (TIF-95).**
