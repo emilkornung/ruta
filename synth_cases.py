@@ -21,8 +21,12 @@ expect keys (all optional; see _validate_synthetic.evaluate):
   skipped_small, forced, unknown, colors_analyzed, page_w, page_h, pnums,
   stdout_has, stdout_lacks
 """
+import contextlib
+import io
 import math
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -1198,3 +1202,129 @@ for nedre, ph_m in ((False, 0.5), (True, 1.0), (False, 4.0)):
              "heights before)",
              d, job=dict(via="job", colour_map={}, ruta_nedre=nedre, page_height_m=ph_m),
              check=grid_reference))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# L. Strip worker pool (TIF-111): processes, not threads
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Every other job case runs in-process (probe.drive_job forces SLICE_WORKERS=1,
+# because spawned workers cannot see this suite's patches). These two cases are
+# the pool's coverage: the same job through a real 2-worker spawn pool must give
+# exactly what the in-process path gives, and the worker count must follow the
+# CPU / memory / cap / strip-count rules.
+
+POOL_W, POOL_H = 4.5, 8.0
+pool_d = Design(POOL_W, POOL_H).background(SKIP_PINK)
+pool_d.band(0, grid_floor(P * 1.3), BLACK, 0, SW)                 # strip 1: Klipp on page 2
+pool_d.band(0, grid_floor(P * 1.6), BLACK, 2 * SW, 3 * SW)        # strip 3: Klipp on page 2
+pool_d.patch(2 * SW + 6, P * 0.4, 20, 20, GREEN)                  # strip 3: a label
+# strip 2 is all background: the placeholder page and its NOTE line, printed in
+# the worker, must still reach the caller's stdout.
+
+
+def _pool_matches_inline(o):
+    pdf, runs = pool_d.pdf(), {}
+    for w in (1, 2):
+        labels, buf = [], io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            strips = slicer._slice_pdf(pdf, POOL_W, POOL_H, LABEL_MAP,
+                                       labels_out=labels, workers=w)
+        notes = sorted(l.strip() for l in buf.getvalue().splitlines()
+                       if l.strip().startswith(("NOTE", "WARNING")))
+        runs[w] = ([n for n, _ in strips],
+                   [probe.render_digest(b, 1.0) for _, b in strips], labels, notes)
+    fails = []
+    for k, what in enumerate(("strip numbers", "strip renders", "label placements",
+                              "NOTE/WARNING lines")):
+        if runs[1][k] != runs[2][k]:
+            fails.append(f"pool (2 workers) differs from in-process in {what}")
+    if not any("every page is background" in n for n in runs[2][3]):
+        fails.append("the pool lost the all-background strip's NOTE line")
+    if not runs[2][2]:
+        fails.append("fixture placed no label — the comparison tests nothing")
+    return fails
+
+
+add(Case("pool/identical-to-inline",
+         "TIF-111: strips run in a spawn process pool (threads gave no speedup); "
+         "a real 2-worker pool must produce the same strips, label placements and "
+         "printed lines as the in-process path",
+         check=_pool_matches_inline))
+
+
+def _worker_count_rules(o):
+    fails = []
+
+    def eq(label, got, want):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, expected {want!r}")
+
+    with tempfile.TemporaryDirectory() as root:
+        def cg(files):
+            d = tempfile.mkdtemp(dir=root)
+            for rel, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+                with open(os.path.join(d, rel), "w") as f:
+                    f.write(text)
+            return d
+
+        host = slicer.available_cpus(cg({}))          # no cgroup files: affinity only
+        eq("v2 quota 2.0", slicer.available_cpus(cg({"cpu.max": "200000 100000"})),
+           min(host, 2))
+        eq("v2 quota 0.5 rounds up to 1",
+           slicer.available_cpus(cg({"cpu.max": "50000 100000"})), 1)
+        eq("v2 no quota", slicer.available_cpus(cg({"cpu.max": "max 100000"})), host)
+        eq("v1 quota 3.0", slicer.available_cpus(cg({
+            "cpu/cpu.cfs_quota_us": "300000", "cpu/cpu.cfs_period_us": "100000"})),
+           min(host, 3))
+        eq("v1 no quota", slicer.available_cpus(cg({
+            "cpu/cpu.cfs_quota_us": "-1", "cpu/cpu.cfs_period_us": "100000"})), host)
+        eq("garbage quota is ignored",
+           slicer.available_cpus(cg({"cpu.max": "lots 100000"})), host)
+
+        gib = 2 ** 30
+        eq("v2 memory", slicer.memory_limit_bytes(cg({"memory.max": str(gib)})), gib)
+        eq("v2 no memory limit", slicer.memory_limit_bytes(cg({"memory.max": "max"})), None)
+        eq("v1 'unlimited'", slicer.memory_limit_bytes(cg({
+            "memory/memory.limit_in_bytes": "9223372036854771712"})), None)
+
+        many = cg({"cpu.max": "800000 100000", "memory.max": str(4 * gib)})
+        with contextlib.redirect_stdout(io.StringIO()), probe.patched({"SLICE_WORKERS": 6}):
+            cpus = slicer.available_cpus(many)
+            eq("cap / cpus / strips", slicer.slice_workers(40, None, many), min(6, cpus))
+            eq("never more workers than strips", slicer.slice_workers(1, None, many), 1)
+            est = 1 * gib                               # 4 GiB x 0.70 fits 2 of these
+            budget = 4 * gib * slicer.MEM_BUDGET_FRACTION - slicer._current_rss_bytes()
+            eq("memory budget caps workers", slicer.slice_workers(40, est, many),
+               max(1, min(6, cpus, int(budget // est))))
+            eq("a job too big for two workers runs in-process",
+               slicer.slice_workers(40, 100 * gib, many), 1)
+        with contextlib.redirect_stdout(io.StringIO()), probe.patched({"SLICE_WORKERS": 1}):
+            eq("cap 1 = in-process", slicer.slice_workers(40, None, many), 1)
+
+    pdf = pool_d.pdf()
+    small = slicer.strip_mem_estimate(pdf, POOL_W, {})
+    big = slicer.strip_mem_estimate(pdf, POOL_W, LABEL_MAP)
+    if not big > small > slicer.WORKER_BASE_MB * 2 ** 20:
+        fails.append(f"strip_mem_estimate must grow with the map: {small} vs {big}")
+
+    for raw, want in (("3", 3), ("0", 7), ("abc", 7), ("", 7), (None, 7)):
+        saved = os.environ.pop("RUTA_SLICE_WORKERS", None)
+        try:
+            if raw is not None:
+                os.environ["RUTA_SLICE_WORKERS"] = raw
+            with contextlib.redirect_stdout(io.StringIO()):
+                eq(f"RUTA_SLICE_WORKERS={raw!r}", slicer._env_int("RUTA_SLICE_WORKERS", 7), want)
+        finally:
+            os.environ.pop("RUTA_SLICE_WORKERS", None)
+            if saved is not None:
+                os.environ["RUTA_SLICE_WORKERS"] = saved
+    return fails
+
+
+add(Case("pool/worker-count",
+         "TIF-111: the worker count is the smallest of the cap (RUTA_SLICE_WORKERS), "
+         "the container's real CPUs (cgroup quota, not the host count), the strip "
+         "count and the memory budget (TIF-100: per-worker column scan)",
+         check=_worker_count_rules))

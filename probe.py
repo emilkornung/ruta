@@ -285,8 +285,9 @@ class LabelRecorder:
     """
     Wraps slicer._label_colors_on_page for the duration of a `with` block, the way
     _design_label_harness does: recounts labelable patches on each clean page
-    before the real labeler runs, then records what it placed. Thread-safe, since
-    run_slice labels strips from a thread pool.
+    before the real labeler runs, then records what it placed. Sees only
+    in-process strips (drive_job forces SLICE_WORKERS=1, TIF-111); the lock is
+    kept so a threaded caller stays safe.
     """
 
     def __init__(self):
@@ -365,9 +366,15 @@ def drive_strip(pdf_bytes, width_m, height_m, strip, nedre, cmap,
 
 
 def drive_job(data, width_m, height_m, **kw):
-    """The real run_slice (the api.py entry point). Returns (result, stdout)."""
+    """The real run_slice (the api.py entry point). Returns (result, stdout).
+
+    Strips run IN-PROCESS here (SLICE_WORKERS=1, TIF-111): the sweep patches
+    slicer's constants and wraps its labeler (patched, LabelRecorder), and a
+    spawned pool worker would see neither. The pool path is covered by its own
+    case, which compares it against this one.
+    """
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with patched({"SLICE_WORKERS": 1}), contextlib.redirect_stdout(buf):
         res = slicer.run_slice(data, width_m, height_m, **kw)
     return res, buf.getvalue()
 
